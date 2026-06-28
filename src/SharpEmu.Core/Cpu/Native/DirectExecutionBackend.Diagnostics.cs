@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -12,10 +13,23 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	private static readonly ConcurrentDictionary<ulong, byte> _knownExecutablePages = new();
 
-	private void RecordRecentImportTrace(string traceLine)
+	private void RecordRecentImportTrace(
+		long dispatchIndex,
+		string nid,
+		ulong returnRip,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2)
 	{
-		_recentImportTrace[_recentImportTraceWriteIndex] = traceLine;
+		_recentImportTrace[_recentImportTraceWriteIndex] = new RecentImportTraceEntry(
+			dispatchIndex,
+			nid,
+			returnRip,
+			arg0,
+			arg1,
+			arg2);
 		_recentImportTraceWriteIndex = (_recentImportTraceWriteIndex + 1) % _recentImportTrace.Length;
 		if (_recentImportTraceCount < _recentImportTrace.Length)
 		{
@@ -34,10 +48,12 @@ public sealed partial class DirectExecutionBackend
 		for (int i = 0; i < _recentImportTraceCount; i++)
 		{
 			int num2 = (num + i) % _recentImportTrace.Length;
-			string text = _recentImportTrace[num2];
-			if (!string.IsNullOrEmpty(text))
+			var entry = _recentImportTrace[num2];
+			if (!string.IsNullOrEmpty(entry.Nid))
 			{
-				Console.Error.WriteLine("[LOADER][INFO]     " + text);
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]     #{entry.DispatchIndex} nid={entry.Nid} ret=0x{entry.ReturnRip:X16} " +
+					$"rdi=0x{entry.Arg0:X16} rsi=0x{entry.Arg1:X16} rdx=0x{entry.Arg2:X16}");
 			}
 		}
 	}
@@ -302,11 +318,24 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe static bool IsExecutableAddress(ulong address)
 	{
+		var pageAddress = address & ~0xFFFUL;
+		if (_knownExecutablePages.ContainsKey(pageAddress))
+		{
+			return true;
+		}
+
 		if (VirtualQuery((void*)address, out var lpBuffer, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
 		{
 			return false;
 		}
-		return lpBuffer.State == 4096 && IsExecutableProtection(lpBuffer.Protect);
+
+		var executable = lpBuffer.State == 4096 && IsExecutableProtection(lpBuffer.Protect);
+		if (executable)
+		{
+			_knownExecutablePages.TryAdd(pageAddress, 0);
+		}
+
+		return executable;
 	}
 
 	private static ulong AlignUp(ulong value, ulong alignment)

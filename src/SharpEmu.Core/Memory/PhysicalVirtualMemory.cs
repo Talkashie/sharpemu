@@ -461,6 +461,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                         return false;
                     }
 
+                    if (CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)destination.Length, region))
+                    {
+                        fixed (byte* destPtr = destination)
+                        {
+                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+                        }
+
+                        return true;
+                    }
+
                     if (!TryTemporarilyProtectForRead((ulong)srcPtr, (ulong)destination.Length, region, out var touchedPages))
                     {
                         return false;
@@ -502,6 +512,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     if (!EnsureRangeCommitted((ulong)destPtr, (ulong)source.Length, region))
                     {
                         return false;
+                    }
+
+                    if (CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
+                    {
+                        fixed (byte* srcPtr = source)
+                        {
+                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                        }
+
+                        return true;
                     }
 
                     if (!VirtualProtect(destPtr, (nuint)source.Length, PAGE_EXECUTE_READWRITE, out var oldProtect))
@@ -631,6 +651,44 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private static bool IsExecutableProtection(uint protection)
     {
         return protection is PAGE_EXECUTE or PAGE_EXECUTE_READ or PAGE_EXECUTE_READWRITE or PAGE_EXECUTE_WRITECOPY;
+    }
+
+    private bool CanReadWithoutProtectionChange(ulong address, ulong size, MemoryRegion region) =>
+        CanAccessWithoutProtectionChange(address, size, region, write: false);
+
+    private bool CanWriteWithoutProtectionChange(ulong address, ulong size, MemoryRegion region) =>
+        CanAccessWithoutProtectionChange(address, size, region, write: true);
+
+    private bool CanAccessWithoutProtectionChange(ulong address, ulong size, MemoryRegion region, bool write)
+    {
+        var startPage = AlignDown(address, PageSize);
+        var endPage = AlignUp(address + size, PageSize);
+        for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
+        {
+            if (_pageProtections.TryGetValue(pageAddress, out var flags))
+            {
+                if (write ? (flags & ProgramHeaderFlags.Write) == 0 : (flags & ProgramHeaderFlags.Read) == 0)
+                {
+                    return false;
+                }
+            }
+            else if (write ? !IsWritableProtection(region.Protection) : !IsReadableProtection(region.Protection))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsReadableProtection(uint protection)
+    {
+        return protection is PAGE_READONLY or PAGE_READWRITE or PAGE_EXECUTE_READ or PAGE_EXECUTE_READWRITE;
+    }
+
+    private static bool IsWritableProtection(uint protection)
+    {
+        return protection is PAGE_READWRITE or PAGE_EXECUTE_READWRITE;
     }
 
     private static uint GetCommitProtection(MemoryRegion region)

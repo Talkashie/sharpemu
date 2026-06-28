@@ -15,6 +15,9 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
+	private static int _lazyCommitTraceCount;
+
 	private unsafe void SetupExceptionHandler()
 	{
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
@@ -911,7 +914,21 @@ public sealed partial class DirectExecutionBackend
 
 		ulong pageBase = faultAddress & 0xFFFFFFFFFFFFF000uL;
 		uint commitProtect = ResolveLazyCommitProtection(accessType, mbi.AllocationProtect);
-		Console.Error.WriteLine($"[LOADER][TRACE] lazy-query: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.State:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.AllocationProtect:X08} prot=0x{mbi.Protect:X08}");
+		int traceIndex = Interlocked.Increment(ref _lazyCommitTraceCount);
+		bool traceLazyCommit = ShouldTraceLazyCommit(traceIndex);
+		if (traceLazyCommit)
+		{
+			Console.Error.WriteLine($"[LOADER][TRACE] lazy-query#{traceIndex}: fault=0x{faultAddress:X16} owner={owner} rip=0x{rip:X16} rsp=0x{rsp:X16} state=0x{mbi.State:X08} base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} alloc=0x{mbi.AllocationProtect:X08} prot=0x{mbi.Protect:X08}");
+		}
+
+		if (mbi.State == 4096 && IsAccessCompatible(accessType, mbi.Protect))
+		{
+			if (traceLazyCommit)
+			{
+				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.Protect:X08}");
+			}
+			return true;
+		}
 
 		bool committed = false;
 		ulong committedBase = 0;
@@ -919,14 +936,25 @@ public sealed partial class DirectExecutionBackend
 
 		if (mbi.State == 65536)
 		{
-			ulong largeBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-			if (TryReserveThenCommit(largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
+			if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var windowBase, out var windowSize) &&
+				TryReserveThenCommit(windowBase, windowSize, windowBase, windowSize, commitProtect))
 			{
 				committed = true;
-				committedBase = largeBase;
-				committedSize = 2097152uL;
+				committedBase = windowBase;
+				committedSize = windowSize;
 			}
 			else
+			{
+				ulong largeBase = faultAddress & 0xFFFFFFFFFFE00000uL;
+				if (TryReserveThenCommit(largeBase, 2097152uL, largeBase, 2097152uL, commitProtect))
+				{
+					committed = true;
+					committedBase = largeBase;
+					committedSize = 2097152uL;
+				}
+			}
+
+			if (!committed)
 			{
 				ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
 				if (TryReserveThenCommit(region64kBase, 65536uL, region64kBase, 65536uL, commitProtect))
@@ -949,7 +977,10 @@ public sealed partial class DirectExecutionBackend
 			}
 
 			TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
-			Console.Error.WriteLine($"[LOADER][TRACE] lazy-reserve-commit: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+			if (traceLazyCommit)
+			{
+				Console.Error.WriteLine($"[LOADER][TRACE] lazy-reserve-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+			}
 			return true;
 		}
 
@@ -958,14 +989,25 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		ulong largeCommitBase = faultAddress & 0xFFFFFFFFFFE00000uL;
-		if (TryCommitRange(largeCommitBase, 2097152uL, commitProtect))
+		if (TryGetLazyCommitWindow(faultAddress, mbi.BaseAddress, mbi.RegionSize, out var commitWindowBase, out var commitWindowSize) &&
+			TryCommitRange(commitWindowBase, commitWindowSize, commitProtect))
 		{
 			committed = true;
-			committedBase = largeCommitBase;
-			committedSize = 2097152uL;
+			committedBase = commitWindowBase;
+			committedSize = commitWindowSize;
 		}
 		else
+		{
+			ulong largeCommitBase = faultAddress & 0xFFFFFFFFFFE00000uL;
+			if (TryCommitRange(largeCommitBase, 2097152uL, commitProtect))
+			{
+				committed = true;
+				committedBase = largeCommitBase;
+				committedSize = 2097152uL;
+			}
+		}
+
+		if (!committed)
 		{
 			ulong region64kBase = faultAddress & 0xFFFFFFFFFFFF0000uL;
 			if (TryCommitRange(region64kBase, 65536uL, commitProtect))
@@ -994,8 +1036,45 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		TryCommitRange(pageBase + 4096, 4096uL, commitProtect);
-		Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+		if (traceLazyCommit)
+		{
+			Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit#{traceIndex}: addr=0x{committedBase:X16} size=0x{committedSize:X16} access={accessType} protect=0x{commitProtect:X8}");
+		}
 		return true;
+
+		static bool TryGetLazyCommitWindow(ulong fault, ulong regionBase, ulong regionSize, out ulong baseAddress, out ulong length)
+		{
+			baseAddress = 0;
+			length = 0;
+			if (regionSize == 0 || ulong.MaxValue - regionBase < regionSize)
+			{
+				return false;
+			}
+
+			ulong regionEnd = regionBase + regionSize;
+			ulong windowBase = fault & ~(LazyCommitWindowBytes - 1);
+			if (windowBase < regionBase)
+			{
+				windowBase = regionBase;
+			}
+
+			if (windowBase >= regionEnd)
+			{
+				return false;
+			}
+
+			ulong windowEnd = Math.Min(regionEnd, windowBase + LazyCommitWindowBytes);
+			ulong windowSize = windowEnd - windowBase;
+			windowSize &= 0xFFFFFFFFFFFFF000uL;
+			if (windowSize == 0)
+			{
+				return false;
+			}
+
+			baseAddress = windowBase;
+			length = windowSize;
+			return true;
+		}
 
 		static unsafe bool TryCommitRange(ulong baseAddress, ulong length, uint protection)
 		{
@@ -1023,6 +1102,49 @@ public sealed partial class DirectExecutionBackend
 			}
 			return TryCommitRange(commitAddress, commitSize, protection);
 		}
+
+		static bool IsAccessCompatible(ulong accessType, uint protection)
+		{
+			const uint pageNoAccess = 0x01;
+			const uint pageReadOnly = 0x02;
+			const uint pageReadWrite = 0x04;
+			const uint pageWriteCopy = 0x08;
+			const uint pageExecute = 0x10;
+			const uint pageExecuteRead = 0x20;
+			const uint pageExecuteReadWrite = 0x40;
+			const uint pageExecuteWriteCopy = 0x80;
+			const uint pageGuard = 0x100;
+			const uint accessMask = 0xFF;
+
+			if ((protection & pageGuard) != 0)
+			{
+				return false;
+			}
+
+			uint access = protection & accessMask;
+			if (access == pageNoAccess)
+			{
+				return false;
+			}
+
+			return accessType switch
+			{
+				0 => access is pageReadOnly or pageReadWrite or pageWriteCopy or pageExecuteRead or pageExecuteReadWrite or pageExecuteWriteCopy,
+				1 => access is pageReadWrite or pageWriteCopy or pageExecuteReadWrite or pageExecuteWriteCopy,
+				8 => access is pageExecute or pageExecuteRead or pageExecuteReadWrite or pageExecuteWriteCopy,
+				_ => false
+			};
+		}
+	}
+
+	private static bool ShouldTraceLazyCommit(int traceIndex)
+	{
+		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_LAZY_COMMIT"), "1", StringComparison.Ordinal))
+		{
+			return true;
+		}
+
+		return traceIndex <= 16 || traceIndex % 256 == 0;
 	}
 
 	private static uint ResolveLazyCommitProtection(ulong accessType, uint allocationProtect)

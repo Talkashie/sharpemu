@@ -14,6 +14,9 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	private readonly object _importResultLogSampleGate = new();
+	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
 		try
@@ -73,8 +76,11 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe ulong DispatchImport(int importIndex, nint argPackPtr)
 	{
-		long num = Interlocked.Increment(ref _importDispatchCount);
-		MarkExecutionProgress();
+		long num = NextImportDispatchIndex();
+		if ((num & 0x3F) == 0)
+		{
+			MarkExecutionProgress();
+		}
 		var cpuContext = ActiveCpuContext;
 		if (cpuContext == null)
 		{
@@ -93,6 +99,12 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][TRACE] Raw sentinel recoveries: {num2} (last import index={importIndex})");
 			_lastReportedRawSentinelRecoveries = num2;
 		}
+		if (IsLeafImport(importStubEntry.Nid) &&
+			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
+		{
+			return leafResult;
+		}
+
 		cpuContext.Rip = importStubEntry.Address;
 		cpuContext[CpuRegister.Rdi] = *(ulong*)argPackPtr;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
@@ -106,6 +118,10 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R13] = *(ulong*)(argPackPtr + 72);
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
+		cpuContext.SetXmmRegister(
+			0,
+			*(ulong*)(argPackPtr - 16),
+			*(ulong*)(argPackPtr - 8));
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
 		ulong value = cpuContext[CpuRegister.Rdi];
 		ulong value2 = cpuContext[CpuRegister.Rsi];
@@ -120,6 +136,7 @@ public sealed partial class DirectExecutionBackend
 		ulong value7 = cpuContext[CpuRegister.R14];
 		ulong value8 = cpuContext[CpuRegister.R15];
 		ulong num7 = *(ulong*)(argPackPtr + 96);
+		var isGuestWorker = GuestThreadExecution.IsGuestThread;
 		if (!IsLikelyReturnAddress(num7))
 		{
 			for (int i = 1; i <= 4; i++)
@@ -134,19 +151,29 @@ public sealed partial class DirectExecutionBackend
 				}
 			}
 		}
-		TrackDistinctImportNid(importStubEntry.Nid);
-		var probeImportReturn = Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET");
-		if (!string.IsNullOrWhiteSpace(probeImportReturn) &&
-			(string.Equals(probeImportReturn, "*", StringComparison.Ordinal) ||
-			 string.Equals(probeImportReturn, importStubEntry.Nid, StringComparison.Ordinal)))
+		if (_activeGuestThreadState is { } activeGuestThreadState)
+		{
+			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
+			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
+		}
+		if (_logStrlenBursts)
+		{
+			TrackDistinctImportNid(importStubEntry.Nid);
+			TrackStrlenPrelude(importStubEntry.Nid, num, num7);
+		}
+		if (!string.IsNullOrWhiteSpace(_probeImportReturn) &&
+			(string.Equals(_probeImportReturn, "*", StringComparison.Ordinal) ||
+			 string.Equals(_probeImportReturn, importStubEntry.Nid, StringComparison.Ordinal)))
 		{
 			ProbeReturnRip(num7, num);
 		}
-		TrackStrlenPrelude(importStubEntry.Nid, num, num7);
-		TraceGuestContext(
-			$"import dispatch={num} nid={importStubEntry.Nid} ret=0x{num7:X16} managed={Environment.CurrentManagedThreadId} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} active={HasActiveExecutionThread}");
-		bool logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
-		if (logBootstrap && string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
+		if (_logGuestContext)
+		{
+			TraceGuestContext(
+				$"import dispatch={num} nid={importStubEntry.Nid} ret=0x{num7:X16} managed={Environment.CurrentManagedThreadId} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} active={HasActiveExecutionThread}");
+		}
+		if (_logBootstrap && string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
 		{
 			string symbolText = "<unreadable>";
 			if (TryReadAsciiZ(value2, 256, out var sym))
@@ -156,7 +183,10 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
 		}
-		if (!ActiveForcedGuestExit && ShouldForceGuestExitOnImportLoop(importStubEntry.Nid, num7, num, value, value2) && TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
+		if (!isGuestWorker &&
+			!ActiveForcedGuestExit &&
+			ShouldForceGuestExitOnImportLoop(importStubEntry.Nid, num7, num, value, value2) &&
+			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
 		{
 			cpuContext[CpuRegister.Rax] = 1uL;
 			return 1uL;
@@ -165,27 +195,33 @@ public sealed partial class DirectExecutionBackend
 		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
 		bool flag2 = num7 >= 2156351360u && num7 <= 2156352080u;
 		bool flag3 = num >= 1020 && num <= 1040;
-		bool logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
-		string importFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FILTER");
-		bool flag4 = !string.IsNullOrWhiteSpace(importFilter);
+		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
-		ExportedFunction matchedExport = null;
-		if (_moduleManager.TryGetExport(importStubEntry.Nid, out ExportedFunction export))
+		ExportedFunction? matchedExport = importStubEntry.Export;
+		bool periodicTrace = num <= 128 ||
+			(num >= 240 && num <= 400) ||
+			(num >= 900 && num <= 1300) ||
+			num % 100000 == 0L ||
+			(importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) ||
+			(importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
+			flag ||
+			flag2 ||
+			flag3;
+		if (matchedExport is not null)
 		{
-			matchedExport = export;
 			if (flag4)
 			{
-				flag5 = export.LibraryName.Contains(importFilter, StringComparison.OrdinalIgnoreCase)
-					|| export.Name.Contains(importFilter, StringComparison.OrdinalIgnoreCase)
-					|| importStubEntry.Nid.Contains(importFilter, StringComparison.OrdinalIgnoreCase);
+				flag5 = matchedExport.LibraryName.Contains(_importFilter!, StringComparison.OrdinalIgnoreCase)
+					|| matchedExport.Name.Contains(_importFilter!, StringComparison.OrdinalIgnoreCase)
+					|| importStubEntry.Nid.Contains(_importFilter!, StringComparison.OrdinalIgnoreCase);
 			}
 		}
 		else if (flag4)
 		{
-			flag5 = importStubEntry.Nid.Contains(importFilter, StringComparison.OrdinalIgnoreCase);
+			flag5 = importStubEntry.Nid.Contains(_importFilter!, StringComparison.OrdinalIgnoreCase);
 		}
-		bool flag6 = logAllImports || flag5;
-		if (!flag0 && (flag6 || num <= 128 || (num >= 240 && num <= 400) || (num >= 900 && num <= 1300) || num % 100000 == 0L || (importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) || (importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) || flag || flag2 || flag3))
+		bool flag6 = _logAllImports || flag5;
+		if (!flag0 && (flag6 || periodicTrace))
 		{
 			if (matchedExport != null)
 			{
@@ -218,9 +254,15 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.Flush();
 			}
 		}
-		if (!flag0)
+		if (!flag0 && !isGuestWorker)
 		{
-			RecordRecentImportTrace($"#{num} nid={importStubEntry.Nid} ret=0x{num7:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16}");
+			RecordRecentImportTrace(
+				num,
+				importStubEntry.Nid,
+				num7,
+				cpuContext[CpuRegister.Rdi],
+				cpuContext[CpuRegister.Rsi],
+				cpuContext[CpuRegister.Rdx]);
 		}
 		if (importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
 		{
@@ -247,11 +289,11 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine($"[LOADER][TRACE] ImportStack#{num}: rsp=0x{num9:X16} [0]=0x{value9:X16} [8]=0x{value10:X16} [10]=0x{value11:X16} [18]=0x{value12:X16} [20]=0x{value13:X16} [28]=0x{value14:X16} [30]=0x{value15:X16} [38]=0x{value16:X16} [40]=0x{value17:X16}");
 				}
 			}
-			if (flag6 && string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal))
+			if (flag6 && _logImportFrames)
 			{
 				TraceImportFrameChain(cpuContext, num);
 			}
-			if (flag6 && string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_RECENT"), "1", StringComparison.Ordinal))
+			if (flag6 && _logImportRecent)
 			{
 				DumpRecentImportTrace();
 			}
@@ -262,7 +304,7 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (importStubEntry.Nid == "Ou3iL1abvng")
 		{
-			if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal))
+			if (_logStackCheck)
 			{
 				var savedGuardAddress = value4 >= 0x10 ? value4 - 0x10 : 0;
 				var guardKnown = TryReadUInt64Compat(value3, out var guardValue);
@@ -300,9 +342,22 @@ public sealed partial class DirectExecutionBackend
 				{
 					orbisGen2Result = DispatchKernelDynlibDlsym();
 				}
+				else if (importStubEntry.Export is { } cachedExport &&
+					(cachedExport.Target & cpuContext.TargetGeneration) != 0)
+				{
+					cpuContext.ClearRaxWriteFlag();
+					var returnValue = cachedExport.Function(cpuContext);
+					if (!cpuContext.WasRaxWritten)
+					{
+						cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
+					}
+					orbisGen2Result = (OrbisGen2Result)returnValue;
+				}
 				else
 				{
-					dispatchResolved = _moduleManager.TryDispatch(importStubEntry.Nid, cpuContext, out orbisGen2Result);
+					dispatchResolved = false;
+					orbisGen2Result = OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+					cpuContext[CpuRegister.Rax] = unchecked((ulong)(int)orbisGen2Result);
 				}
 			}
 			finally
@@ -318,7 +373,9 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
-				Console.Error.WriteLine($"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16}");
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
 					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
@@ -337,9 +394,12 @@ public sealed partial class DirectExecutionBackend
 			}
 			else if (orbisGen2Result != OrbisGen2Result.ORBIS_GEN2_OK)
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+				if (ShouldLogImportResult(importStubEntry.Nid, orbisGen2Result))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
 			cpuContext[CpuRegister.Rbp] = value4;
@@ -349,11 +409,36 @@ public sealed partial class DirectExecutionBackend
 			cpuContext[CpuRegister.R15] = value8;
 			cpuContext[CpuRegister.Rdi] = value;
 			cpuContext[CpuRegister.Rsi] = value2;
-			if (GuestThreadExecution.TryConsumeCurrentEntryExit(out var exitStatus, out var exitReason))
+			if (GuestThreadExecution.TryConsumeCurrentContextTransfer(out var transferTarget))
 			{
-				if (TryCompleteGuestEntryToHostStub(argPackPtr, num, num7, importStubEntry.Nid, exitReason, exitStatus))
+				if (!TryPrepareGuestContextTransfer(
+						transferTarget,
+						out var transferFrame,
+						out var transferStub,
+						out var transferError))
 				{
-					cpuContext[CpuRegister.Rax] = unchecked((ulong)exitStatus);
+					LastError = transferError ?? "failed to prepare guest context transfer";
+					ActiveForcedGuestExit = true;
+					cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
+					return cpuContext[CpuRegister.Rax];
+				}
+
+				*(ulong*)(argPackPtr + 96) = unchecked((ulong)transferStub);
+				if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] fiber.context-transfer rip=0x{transferTarget.Rip:X16} " +
+						$"rsp=0x{transferTarget.Rsp:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+						$"fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16}");
+				}
+
+				return unchecked((ulong)transferFrame);
+			}
+			if (GuestThreadExecution.TryConsumeCurrentEntryExit(out var exitValue, out var exitReason))
+			{
+				if (TryCompleteGuestEntryToHostStub(argPackPtr, num, num7, importStubEntry.Nid, exitReason, exitValue))
+				{
+					cpuContext[CpuRegister.Rax] = exitValue;
 				}
 				else
 				{
@@ -361,9 +446,27 @@ public sealed partial class DirectExecutionBackend
 					cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
 				}
 			}
-			if (GuestThreadExecution.TryConsumeCurrentThreadBlock(out var blockReason) &&
+			if (GuestThreadExecution.TryConsumeCurrentThreadBlock(
+					out var blockReason,
+					out var blockContinuation,
+					out var hasBlockContinuation,
+					out var blockWakeKey,
+					out var blockResumeHandler,
+					out var blockWakeHandler,
+					out var blockDeadlineTimestamp) &&
 				TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, blockReason))
 			{
+				if (hasBlockContinuation)
+				{
+					RegisterBlockedGuestThreadContinuation(
+						GuestThreadExecution.CurrentGuestThreadHandle,
+						blockContinuation,
+						blockWakeKey,
+						blockResumeHandler,
+						blockWakeHandler,
+						blockDeadlineTimestamp);
+				}
+
 				cpuContext[CpuRegister.Rax] = 0uL;
 			}
 			if (flag || flag2 || flag3)
@@ -382,6 +485,221 @@ public sealed partial class DirectExecutionBackend
 			cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
 			return 18446744071562199298uL;
 		}
+	}
+
+	private unsafe bool TryDispatchLeafImport(
+		CpuContext cpuContext,
+		ImportStubEntry importStubEntry,
+		nint argPackPtr,
+		long dispatchIndex,
+		out ulong result)
+	{
+		result = 0;
+		if (importStubEntry.Export is not { } export ||
+			(export.Target & cpuContext.TargetGeneration) == 0)
+		{
+			return false;
+		}
+
+		var arg0 = *(ulong*)argPackPtr;
+		var returnRip = *(ulong*)(argPackPtr + 96);
+		cpuContext.Rip = importStubEntry.Address;
+		cpuContext[CpuRegister.Rdi] = arg0;
+		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
+		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
+		cpuContext[CpuRegister.Rcx] = *(ulong*)(argPackPtr + 24);
+		cpuContext[CpuRegister.R8] = *(ulong*)(argPackPtr + 32);
+		cpuContext[CpuRegister.R9] = *(ulong*)(argPackPtr + 40);
+		cpuContext[CpuRegister.Rbx] = *(ulong*)(argPackPtr + 48);
+		cpuContext[CpuRegister.Rbp] = *(ulong*)(argPackPtr + 56);
+		cpuContext[CpuRegister.R12] = *(ulong*)(argPackPtr + 64);
+		cpuContext[CpuRegister.R13] = *(ulong*)(argPackPtr + 72);
+		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
+		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
+		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
+
+		if (_activeGuestThreadState is { } activeGuestThreadState)
+		{
+			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
+			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
+		}
+		if (dispatchIndex % 100000 == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] Import#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid})");
+		}
+
+		var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(
+			returnRip,
+			(ulong)argPackPtr + 104uL,
+			ActiveGuestReturnSlotAddress);
+		int returnValue;
+		try
+		{
+			cpuContext.ClearRaxWriteFlag();
+			returnValue = export.Function(cpuContext);
+			if (!cpuContext.WasRaxWritten)
+			{
+				cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
+			}
+		}
+		finally
+		{
+			GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
+		}
+
+		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+		{
+			var returnResult = (OrbisGen2Result)returnValue;
+			if (ShouldLogImportResult(importStubEntry.Nid, returnResult))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] Import#{dispatchIndex} result: {returnResult} ({importStubEntry.Nid}) " +
+					$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+					$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+					$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} " +
+					$"ret=0x{returnRip:X16}");
+			}
+		}
+
+		if (GuestThreadExecution.TryConsumeCurrentThreadBlock(
+				out var blockReason,
+				out var blockContinuation,
+				out var hasBlockContinuation,
+				out var blockWakeKey,
+				out var blockResumeHandler,
+				out var blockWakeHandler,
+				out var blockDeadlineTimestamp) &&
+			TryYieldGuestThreadToHostStub(argPackPtr, dispatchIndex, returnRip, importStubEntry.Nid, blockReason))
+		{
+			if (hasBlockContinuation)
+			{
+				RegisterBlockedGuestThreadContinuation(
+					GuestThreadExecution.CurrentGuestThreadHandle,
+					blockContinuation,
+					blockWakeKey,
+					blockResumeHandler,
+					blockWakeHandler,
+					blockDeadlineTimestamp);
+			}
+
+			cpuContext[CpuRegister.Rax] = 0uL;
+		}
+
+		result = cpuContext[CpuRegister.Rax];
+		return true;
+	}
+
+	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
+	{
+		var expectedFileProbeMiss =
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
+			IsExpectedFileProbeNotFoundNid(nid);
+		var expectedTimedWaitTimeout =
+			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
+			unchecked((int)result) == 60;
+		if (!expectedFileProbeMiss && !expectedTimedWaitTimeout)
+		{
+			return true;
+		}
+
+		var key = nid + "\0" + (int)result;
+		int count;
+		lock (_importResultLogSampleGate)
+		{
+			_importResultLogSamples.TryGetValue(key, out count);
+			count++;
+			_importResultLogSamples[key] = count;
+		}
+
+		return count <= 8 || count % 10000 == 0;
+	}
+
+	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
+		nid is
+			"eV9wAD2riIA" or // sceKernelStat
+			"1G3lF1Gg1k8" or // sceKernelOpen
+			"gEpBkcwxUjw";   // sceKernelAprResolveFilepathsToIdsAndFileSizes
+
+	private bool IsLeafImport(string nid)
+	{
+		if (nid == "1jfXLRVzisc")
+		{
+			return !_logUsleep;
+		}
+
+		return nid is
+			"9UK1vLZQft4" or
+			"tn3VlD0hG60" or
+			"7H0iTOciTLo" or
+			"2Z+PpY6CaJg" or
+			"8aI7R7WaOlc" or
+			"a8uLzYY--tM" or
+			"Qs1xtplKo0U" or
+			"GuchCTefuZw" or
+			"N-FSPA4S3nI" or
+			"baQO9ez2gL4" or
+			"ULvXMDz56po" or
+			"mQ16-QdKv7k" or
+			"vWU-odnS+fU" or
+			"sSAUCCU1dv4" or
+			"C+IEj+BsAFM" or
+			"tZDDEo2tE5k" or
+			"GnxKOHEawhk" or
+			"H896Pt-yB4I" or
+			"sJXyWHjP-F8" or
+			"ASoW5WE-UPo" or
+			"rqwFKI4PAiM" or
+			"eE4Szl8sil8" or
+			"qvMUCyyaCSI" or
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"j4ViWNHEgww" or // strlen
+			"5jNubw4vlAA" or // strnlen
+			"LHMrG7e8G78" or // wcslen
+			"WkkeywLJcgU" or // wcslen
+			"Ovb2dSJOAuE" or // strcmp
+			"aesyjrHVWy4" or // strncmp
+			"pNtJdE3x49E" or // wcscmp
+			"fV2xHER+bKE" or // wcscoll
+			"E8wCoUEbfzk" or // wcsncmp
+			"Q3VBxCXhUHs" or // memcpy
+			"+P6FRGH4LfA" or // memmove
+			"DfivPArhucg" or // memcmp
+			"ytQULN-nhL4" or // pthread_rwlock_init
+			"6ULAa0fq4jA" or // scePthreadRwlockInit
+			"1471ajPzxh0" or // pthread_rwlock_destroy
+			"BB+kb08Tl9A" or // scePthreadRwlockDestroy
+			"iGjsr1WAtI0" or // pthread_rwlock_rdlock
+			"Ox9i0c7L5w0" or // scePthreadRwlockRdlock
+			"sIlRvQqsN2Y" or // pthread_rwlock_wrlock
+			"mqdNorrB+gI" or // scePthreadRwlockWrlock
+			"EgmLo6EWgso" or // pthread_rwlock_unlock
+			"+L98PIbGttk" or // scePthreadRwlockUnlock
+			"aI+OeCz8xrQ" or // scePthreadSelf
+			"EotR8a3ASf4" or // pthread_self
+			"eoht7mQOCmo" or // scePthreadGetspecific
+			"0-KXaS70xy4" or // pthread_getspecific
+			"+BzXYkqYeLE" or // scePthreadSetspecific
+			"WrOLvHU0yQM" or // pthread_setspecific
+			"vz+pg2zdopI" or // sceKernelGetEventUserData
+			"mJ7aghmgvfc" or // sceKernelGetEventId
+			"23CPPI1tyBY" or // sceKernelGetEventFilter
+			"kwGyyjohI50";   // sceKernelGetEventData
+	}
+
+	private long NextImportDispatchIndex()
+	{
+		if (!ReferenceEquals(_importCounterOwner, this) ||
+			_nextImportDispatchIndex >= _importDispatchBlockEnd)
+		{
+			var blockEnd = Interlocked.Add(ref _importDispatchCount, ImportDispatchBlockSize);
+			_importCounterOwner = this;
+			_nextImportDispatchIndex = blockEnd - ImportDispatchBlockSize + 1;
+			_importDispatchBlockEnd = blockEnd + 1;
+		}
+
+		return _nextImportDispatchIndex++;
 	}
 
 	private void TraceImportFrameChain(CpuContext context, long dispatchIndex)
@@ -431,7 +749,7 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
-	private unsafe bool TryCompleteGuestEntryToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, string reason, int status)
+	private unsafe bool TryCompleteGuestEntryToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, string reason, ulong value)
 	{
 		ulong hostExit = ActiveEntryReturnSentinelRip;
 		if (hostExit < 65536 || !TryPatchActiveGuestReturnSlot(hostExit))
@@ -447,7 +765,7 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 		Console.Error.WriteLine(
-			$"[LOADER][INFO] Guest entry exit at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={reason} status={status}");
+			$"[LOADER][INFO] Guest entry exit at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={reason} value=0x{value:X16}");
 		return true;
 	}
 
@@ -469,8 +787,11 @@ public sealed partial class DirectExecutionBackend
 
 		ActiveGuestThreadYieldRequested = true;
 		ActiveGuestThreadYieldReason = string.IsNullOrWhiteSpace(reason) ? nid : reason;
-		Console.Error.WriteLine(
-			$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason}");
+		if (_logGuestThreads)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason}");
+		}
 		return true;
 	}
 
@@ -488,7 +809,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"), "1", StringComparison.Ordinal))
+		if (_disableImportLoopGuard || _importLoopGuardSeconds <= 0)
 		{
 			return false;
 		}
@@ -503,6 +824,10 @@ public sealed partial class DirectExecutionBackend
 			_importNidHashCache[nid] = value;
 		}
 		RecordImportLoopSignature(value, returnRip, BuildImportLoopSignature(value, returnRip, arg0, arg1));
+		if ((dispatchIndex & 0x3F) != 0)
+		{
+			return false;
+		}
 		if (!HasRepeatingImportLoopPattern())
 		{
 			if (_importLoopPatternHits > 0)
@@ -520,14 +845,13 @@ public sealed partial class DirectExecutionBackend
 			_importLoopPatternStartTimestamp = Stopwatch.GetTimestamp();
 		}
 		_importLoopPatternHits++;
-		var guardSeconds = GetImportLoopGuardSeconds();
-		if (guardSeconds <= 0 || _importLoopPatternHits < 6)
+		if (_importLoopPatternHits < 6)
 		{
 			return false;
 		}
 
 		var elapsedTicks = Stopwatch.GetTimestamp() - _importLoopPatternStartTimestamp;
-		return elapsedTicks >= (long)(guardSeconds * Stopwatch.Frequency);
+		return elapsedTicks >= (long)(_importLoopGuardSeconds * Stopwatch.Frequency);
 	}
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>
@@ -810,8 +1134,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			return result;
 		}
-		bool logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
-		if (logBootstrap)
+		if (_logBootstrap)
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_dispatch: handle=0x{bridgeHandle:X16} symbol='{symbolName}' out=0x{outputAddress:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16}");

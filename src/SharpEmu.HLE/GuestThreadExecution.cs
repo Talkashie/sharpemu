@@ -1,6 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Diagnostics;
+
 namespace SharpEmu.HLE;
 
 public readonly record struct GuestThreadStartRequest(
@@ -10,11 +12,26 @@ public readonly record struct GuestThreadStartRequest(
     ulong AttributeAddress,
     string Name);
 
+public readonly record struct GuestThreadSnapshot(
+    ulong ThreadHandle,
+    string Name,
+    string State,
+    long ImportCount,
+    string? LastImportNid,
+    ulong LastReturnRip,
+    string? BlockReason);
+
 public interface IGuestThreadScheduler
 {
+    bool SupportsGuestContextTransfer { get; }
+
     bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error);
 
     void Pump(CpuContext callerContext, string reason);
+
+    int WakeBlockedThreads(string wakeKey, int maxCount = int.MaxValue);
+
+    IReadOnlyList<GuestThreadSnapshot> SnapshotThreads();
 
     bool TryCallGuestFunction(
         CpuContext callerContext,
@@ -72,13 +89,37 @@ public static class GuestThreadExecution
     private static string? _pendingBlockReason;
 
     [ThreadStatic]
+    private static bool _pendingBlockContinuationValid;
+
+    [ThreadStatic]
+    private static GuestCpuContinuation _pendingBlockContinuation;
+
+    [ThreadStatic]
+    private static string? _pendingBlockWakeKey;
+
+    [ThreadStatic]
+    private static Func<int>? _pendingBlockResumeHandler;
+
+    [ThreadStatic]
+    private static Func<bool>? _pendingBlockWakeHandler;
+
+    [ThreadStatic]
+    private static long _pendingBlockDeadlineTimestamp;
+
+    [ThreadStatic]
     private static bool _pendingEntryExit;
 
     [ThreadStatic]
-    private static int _pendingEntryExitStatus;
+    private static ulong _pendingEntryExitValue;
 
     [ThreadStatic]
     private static string? _pendingEntryExitReason;
+
+    [ThreadStatic]
+    private static bool _pendingContextTransfer;
+
+    [ThreadStatic]
+    private static GuestCpuContinuation _pendingContextTransferTarget;
 
     [ThreadStatic]
     private static bool _hasCurrentImportCallFrame;
@@ -105,9 +146,17 @@ public static class GuestThreadExecution
         var previous = _currentGuestThreadHandle;
         _currentGuestThreadHandle = threadHandle;
         _pendingBlockReason = null;
+        _pendingBlockContinuationValid = false;
+        _pendingBlockContinuation = default;
+        _pendingBlockWakeKey = null;
+        _pendingBlockResumeHandler = null;
+        _pendingBlockWakeHandler = null;
+        _pendingBlockDeadlineTimestamp = 0;
         _pendingEntryExit = false;
-        _pendingEntryExitStatus = 0;
+        _pendingEntryExitValue = 0;
         _pendingEntryExitReason = null;
+        _pendingContextTransfer = false;
+        _pendingContextTransferTarget = default;
         _hasCurrentImportCallFrame = false;
         _currentImportReturnRip = 0;
         _currentImportResumeRsp = 0;
@@ -119,9 +168,17 @@ public static class GuestThreadExecution
     {
         _currentGuestThreadHandle = previousThreadHandle;
         _pendingBlockReason = null;
+        _pendingBlockContinuationValid = false;
+        _pendingBlockContinuation = default;
+        _pendingBlockWakeKey = null;
+        _pendingBlockResumeHandler = null;
+        _pendingBlockWakeHandler = null;
+        _pendingBlockDeadlineTimestamp = 0;
         _pendingEntryExit = false;
-        _pendingEntryExitStatus = 0;
+        _pendingEntryExitValue = 0;
         _pendingEntryExitReason = null;
+        _pendingContextTransfer = false;
+        _pendingContextTransferTarget = default;
         _hasCurrentImportCallFrame = false;
         _currentImportReturnRip = 0;
         _currentImportResumeRsp = 0;
@@ -140,7 +197,15 @@ public static class GuestThreadExecution
         _currentFiberAddress = previousFiberAddress;
     }
 
-    public static bool RequestCurrentThreadBlock(string reason)
+    public static bool RequestCurrentThreadBlock(string reason) => RequestCurrentThreadBlock(null, reason);
+
+    public static bool RequestCurrentThreadBlock(
+        CpuContext? context,
+        string reason,
+        string? wakeKey = null,
+        Func<int>? resumeHandler = null,
+        Func<bool>? wakeHandler = null,
+        long blockDeadlineTimestamp = 0)
     {
         if (!IsGuestThread)
         {
@@ -148,31 +213,167 @@ public static class GuestThreadExecution
         }
 
         _pendingBlockReason = string.IsNullOrWhiteSpace(reason) ? "guest_thread_blocked" : reason;
+        _pendingBlockWakeKey = string.IsNullOrWhiteSpace(wakeKey) ? _pendingBlockReason : wakeKey;
+        _pendingBlockResumeHandler = resumeHandler;
+        _pendingBlockWakeHandler = wakeHandler;
+        _pendingBlockDeadlineTimestamp = blockDeadlineTimestamp;
+        if (context is not null && TryCaptureCurrentBlockContinuation(context, out var continuation))
+        {
+            _pendingBlockContinuation = continuation;
+            _pendingBlockContinuationValid = true;
+        }
+        else
+        {
+            _pendingBlockContinuation = default;
+            _pendingBlockContinuationValid = false;
+        }
+
         return true;
     }
 
     public static bool TryConsumeCurrentThreadBlock(out string reason)
     {
+        return TryConsumeCurrentThreadBlock(out reason, out _, out _);
+    }
+
+    public static bool TryConsumeCurrentThreadBlock(
+        out string reason,
+        out GuestCpuContinuation continuation,
+        out bool hasContinuation)
+    {
+        return TryConsumeCurrentThreadBlock(
+            out reason,
+            out continuation,
+            out hasContinuation,
+            out _,
+            out _,
+            out _,
+            out _);
+    }
+
+    public static bool TryConsumeCurrentThreadBlock(
+        out string reason,
+        out GuestCpuContinuation continuation,
+        out bool hasContinuation,
+        out string wakeKey,
+        out Func<int>? resumeHandler,
+        out Func<bool>? wakeHandler)
+    {
+        return TryConsumeCurrentThreadBlock(
+            out reason,
+            out continuation,
+            out hasContinuation,
+            out wakeKey,
+            out resumeHandler,
+            out wakeHandler,
+            out _);
+    }
+
+    public static bool TryConsumeCurrentThreadBlock(
+        out string reason,
+        out GuestCpuContinuation continuation,
+        out bool hasContinuation,
+        out string wakeKey,
+        out Func<int>? resumeHandler,
+        out Func<bool>? wakeHandler,
+        out long blockDeadlineTimestamp)
+    {
         reason = _pendingBlockReason ?? string.Empty;
         if (string.IsNullOrEmpty(reason))
         {
+            continuation = default;
+            hasContinuation = false;
+            wakeKey = string.Empty;
+            resumeHandler = null;
+            wakeHandler = null;
+            blockDeadlineTimestamp = 0;
             return false;
         }
 
+        continuation = _pendingBlockContinuation;
+        hasContinuation = _pendingBlockContinuationValid;
+        wakeKey = _pendingBlockWakeKey ?? reason;
+        resumeHandler = _pendingBlockResumeHandler;
+        wakeHandler = _pendingBlockWakeHandler;
+        blockDeadlineTimestamp = _pendingBlockDeadlineTimestamp;
         _pendingBlockReason = null;
+        _pendingBlockContinuation = default;
+        _pendingBlockContinuationValid = false;
+        _pendingBlockWakeKey = null;
+        _pendingBlockResumeHandler = null;
+        _pendingBlockWakeHandler = null;
+        _pendingBlockDeadlineTimestamp = 0;
+        return true;
+    }
+
+    public static long ComputeDeadlineTimestamp(TimeSpan timeout)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            return Stopwatch.GetTimestamp();
+        }
+
+        var ticks = timeout.TotalSeconds >= long.MaxValue / (double)Stopwatch.Frequency
+            ? long.MaxValue
+            : (long)Math.Ceiling(timeout.TotalSeconds * Stopwatch.Frequency);
+        var now = Stopwatch.GetTimestamp();
+        if (long.MaxValue - now <= ticks)
+        {
+            return long.MaxValue;
+        }
+
+        return now + Math.Max(1, ticks);
+    }
+
+    private static bool TryCaptureCurrentBlockContinuation(CpuContext context, out GuestCpuContinuation continuation)
+    {
+        if (!TryGetCurrentImportCallFrame(out var frame) ||
+            frame.ReturnRip < 65536 ||
+            frame.ResumeRsp == 0 ||
+            frame.ReturnSlotAddress == 0)
+        {
+            continuation = default;
+            return false;
+        }
+
+        continuation = new GuestCpuContinuation(
+            frame.ReturnRip,
+            frame.ResumeRsp,
+            frame.ReturnSlotAddress,
+            context.Rflags,
+            context.FsBase,
+            context.GsBase,
+            0,
+            context[CpuRegister.Rcx],
+            context[CpuRegister.Rdx],
+            context[CpuRegister.Rbx],
+            context[CpuRegister.Rbp],
+            context[CpuRegister.Rsi],
+            context[CpuRegister.Rdi],
+            context[CpuRegister.R8],
+            context[CpuRegister.R9],
+            context[CpuRegister.R12],
+            context[CpuRegister.R13],
+            context[CpuRegister.R14],
+            context[CpuRegister.R15]);
         return true;
     }
 
     public static void RequestCurrentEntryExit(string reason, int status)
     {
+        RequestCurrentEntryExit(reason, unchecked((ulong)(long)status));
+    }
+
+    public static void RequestCurrentEntryExit(string reason, ulong value)
+    {
         _pendingEntryExit = true;
-        _pendingEntryExitStatus = status;
+        _pendingEntryExitValue = value;
         _pendingEntryExitReason = string.IsNullOrWhiteSpace(reason) ? "guest_entry_exit" : reason;
     }
 
-    public static bool TryConsumeCurrentEntryExit(out int status, out string reason)
+    public static bool TryConsumeCurrentEntryExit(out ulong value, out string reason)
     {
-        status = _pendingEntryExitStatus;
+        value = _pendingEntryExitValue;
         reason = _pendingEntryExitReason ?? string.Empty;
         if (!_pendingEntryExit)
         {
@@ -180,8 +381,27 @@ public static class GuestThreadExecution
         }
 
         _pendingEntryExit = false;
-        _pendingEntryExitStatus = 0;
+        _pendingEntryExitValue = 0;
         _pendingEntryExitReason = null;
+        return true;
+    }
+
+    public static void RequestCurrentContextTransfer(GuestCpuContinuation target)
+    {
+        _pendingContextTransferTarget = target;
+        _pendingContextTransfer = true;
+    }
+
+    public static bool TryConsumeCurrentContextTransfer(out GuestCpuContinuation target)
+    {
+        target = _pendingContextTransferTarget;
+        if (!_pendingContextTransfer)
+        {
+            return false;
+        }
+
+        _pendingContextTransfer = false;
+        _pendingContextTransferTarget = default;
         return true;
     }
 
