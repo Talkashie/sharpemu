@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Threading;
@@ -16,10 +17,14 @@ public static class NetExports
     private const int MaxNameLength = 256;
 
     private static readonly ConcurrentDictionary<int, NetPool> _pools = new();
+    private static readonly ConcurrentDictionary<int, ResolverContext> _resolvers = new();
     private static int _nextPoolId;
+    private static int _nextResolverId = 0x2000;
     private static bool _initialized;
 
     private sealed record NetPool(string Name, int Size, int Flags);
+
+    private sealed record ResolverContext(string Name, int PoolId, int Flags, int LastError);
 
     [SysAbiExport(
         Nid = "Nlev7Lg8k3A",
@@ -42,6 +47,7 @@ public static class NetExports
     {
         _initialized = false;
         _pools.Clear();
+        _resolvers.Clear();
         TraceNet("term", 0, 0, 0, 0);
         return SetReturn(ctx, 0);
     }
@@ -89,6 +95,70 @@ public static class NetExports
 
         TraceNet("pool.destroy", id, 0, 0, _initialized ? 1UL : 0UL);
         return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "C4UgDHHPvdw",
+        ExportName = "sceNetResolverCreate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetResolverCreate(CpuContext ctx)
+    {
+        var nameAddress = ctx[CpuRegister.Rdi];
+        var poolId = unchecked((int)ctx[CpuRegister.Rsi]);
+        var flags = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (flags != 0)
+        {
+            return SetReturn(ctx, NetErrorInvalidArgument);
+        }
+
+        var name = TryReadUtf8Z(ctx, nameAddress, MaxNameLength, out var value)
+            ? value
+            : string.Empty;
+        var id = Interlocked.Increment(ref _nextResolverId);
+        _resolvers[id] = new ResolverContext(name, poolId, flags, 0);
+        TraceNet("resolver.create", id, unchecked((ulong)poolId), unchecked((ulong)flags), _initialized ? 1UL : 0UL);
+        ctx[CpuRegister.Rax] = unchecked((ulong)id);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "kJlYH5uMAWI",
+        ExportName = "sceNetResolverDestroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetResolverDestroy(CpuContext ctx)
+    {
+        var id = unchecked((int)ctx[CpuRegister.Rdi]);
+        return _resolvers.TryRemove(id, out _)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, NetErrorBadFileDescriptor);
+    }
+
+    [SysAbiExport(
+        Nid = "J5i3hiLJMPk",
+        ExportName = "sceNetResolverGetError",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetResolverGetError(CpuContext ctx)
+    {
+        var id = unchecked((int)ctx[CpuRegister.Rdi]);
+        var statusAddress = ctx[CpuRegister.Rsi];
+        if (statusAddress == 0)
+        {
+            return SetReturn(ctx, NetErrorInvalidArgument);
+        }
+
+        if (!_resolvers.TryGetValue(id, out var resolver))
+        {
+            return SetReturn(ctx, NetErrorBadFileDescriptor);
+        }
+
+        Span<byte> status = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(status, resolver.LastError);
+        return ctx.Memory.TryWrite(statusAddress, status)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     private static int SetReturn(CpuContext ctx, int result)
