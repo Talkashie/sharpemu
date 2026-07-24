@@ -66,6 +66,85 @@ public static class Ngs2Exports
         public float Gain { get; set; } = 1f;
     }
 
+    // Calculate a deterministic waveform block for titles that ask NGS2 to
+    // translate a sample range into a byte-range descriptor.  The exact
+    // compressed-codec layout varies by waveform type; until those codecs are
+    // implemented, preserve the requested range one-for-one so callers receive
+    // initialized, forward-progressing output instead of repeatedly inspecting
+    // an untouched stack structure.
+    [SysAbiExport(
+        Nid = "3pCNbVM11UA",
+        ExportName = "sceNgs2CalcWaveformBlock",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2CalcWaveformBlock(CpuContext ctx)
+    {
+        const int waveformFormatSize = 0x18;
+        const int waveformBlockSize = 0x20;
+
+        var formatAddress = ctx[CpuRegister.Rdi];
+        var samplePosition = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var requestedSamples = unchecked((uint)ctx[CpuRegister.Rdx]);
+        var outBlockAddress = ctx[CpuRegister.Rcx];
+
+        if (outBlockAddress == 0)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        if (formatAddress == 0)
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> format = stackalloc byte[waveformFormatSize];
+        if (!ctx.Memory.TryRead(formatAddress, format))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var waveformType = BinaryPrimitives.ReadUInt32LittleEndian(format[0x00..0x04]);
+        var numChannels = BinaryPrimitives.ReadUInt32LittleEndian(format[0x04..0x08]);
+        var sampleRate = BinaryPrimitives.ReadUInt32LittleEndian(format[0x08..0x0C]);
+        var configData = BinaryPrimitives.ReadUInt32LittleEndian(format[0x0C..0x10]);
+        var frameOffset = BinaryPrimitives.ReadUInt32LittleEndian(format[0x10..0x14]);
+        var frameMargin = BinaryPrimitives.ReadUInt32LittleEndian(format[0x14..0x18]);
+
+        // SceNgs2WaveformBlock (0x20 bytes): dataOffset, dataSize, repeats,
+        // skipSamples, numSamples, reserved, userData.  A monotonic one-byte-
+        // per-sample fallback is safer than leaving the caller's output
+        // untouched and is sufficient for games that use this during metadata
+        // setup rather than codec decoding.
+        var dataOffset = samplePosition;
+        var dataSize = requestedSamples;
+
+        Span<byte> block = stackalloc byte[waveformBlockSize];
+        block.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(block[0x00..0x04], dataOffset);
+        BinaryPrimitives.WriteUInt32LittleEndian(block[0x04..0x08], dataSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(block[0x10..0x14], requestedSamples);
+
+        if (!ctx.Memory.TryWrite(outBlockAddress, block))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var call = Interlocked.Increment(ref _waveformBlockCalcCount);
+        if (call <= 32)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] ngs2.calc_waveform_block#{call} " +
+                $"format=0x{formatAddress:X16} type={waveformType} channels={numChannels} " +
+                $"rate={sampleRate} config=0x{configData:X8} frameOffset={frameOffset} " +
+                $"frameMargin={frameMargin} samplePos={samplePosition} requested={requestedSamples} " +
+                $"out=0x{outBlockAddress:X16} dataOffset={dataOffset} dataSize={dataSize}");
+        }
+
+        return SetReturn(ctx, 0);
+    }
+
+    private static long _waveformBlockCalcCount;
+
     [SysAbiExport(
         Nid = "mPYgU4oYpuY",
         ExportName = "sceNgs2SystemCreateWithAllocator",
