@@ -42,6 +42,18 @@ public static class Gen5ShaderScalarEvaluator
     private static readonly ConcurrentDictionary<ulong, byte> _emptySrtScalarPointerFallbacks =
         new();
 
+    // Isaac's NGG export shaders receive their indirect table pointer in the
+    // seventh user-data pair (s14:s15 with the normal s8 base), but these five
+    // shaders read that table through s12:s13. Keep the normal register window
+    // intact and alias only the affected shaders instead of shifting every
+    // user-data register, which corrupts unrelated buffer descriptors.
+    private static readonly bool _isaacS12PointerAliasEnabled =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_ISAAC_S12_ALIAS"),
+            "1",
+            StringComparison.Ordinal);
+    private static int _isaacS12PointerAliasTraceCount;
+
     public static bool WasEmptySrtScalarPointerFallback(ulong shaderAddress) =>
         _emptySrtScalarPointerFallbacks.ContainsKey(shaderAddress);
 
@@ -97,6 +109,48 @@ public static class Gen5ShaderScalarEvaluator
         ulong SizeBytes,
         uint NumberFormat,
         uint DataFormat);
+
+    private static void ApplyIsaacS12PointerAlias(
+        Gen5ShaderState state,
+        Span<uint> scalarRegisters)
+    {
+        if (!_isaacS12PointerAliasEnabled ||
+            !IsIsaacExportShaderNeedingS12Alias(state.Program.Address) ||
+            scalarRegisters[12] != 0 ||
+            scalarRegisters[13] != 0)
+        {
+            return;
+        }
+
+        var pointer = scalarRegisters[14] |
+            ((ulong)scalarRegisters[15] << 32);
+        if (pointer < 0x0000000100000000UL ||
+            pointer >= 0x0000800000000000UL)
+        {
+            return;
+        }
+
+        scalarRegisters[12] = scalarRegisters[14];
+        scalarRegisters[13] = scalarRegisters[15];
+
+        var sample = Interlocked.Increment(
+            ref _isaacS12PointerAliasTraceCount);
+        if (sample <= 16)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.isaac_s12_pointer_alias " +
+                $"sample={sample} shader=0x{state.Program.Address:X16} " +
+                $"value=0x{pointer:X16}");
+        }
+    }
+
+    private static bool IsIsaacExportShaderNeedingS12Alias(ulong address) =>
+        address is
+            0x00000001102E0200UL or
+            0x00000001102E1400UL or
+            0x00000001102E3E00UL or
+            0x00000001102E8C00UL or
+            0x00000001115D4300UL;
 
     private readonly record struct ScalarPathState(
         uint StartPc,
@@ -163,6 +217,8 @@ public static class Gen5ShaderScalarEvaluator
         {
             computeSystemRegisters.ClearStaticValues(scalarRegisters);
         }
+
+        ApplyIsaacS12PointerAlias(state, scalarRegisters);
 
         var execMask = RdnaWaveMask;
         WriteScalarPair(scalarRegisters, 106, 0, ref execMask);
