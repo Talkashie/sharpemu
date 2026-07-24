@@ -5820,19 +5820,10 @@ public static partial class AgcExports
         foreach (var target in renderTargets)
         {
             state.KnownRenderTargets[target.Address] = target;
-            // Colour exports originate in the pixel stage.  A depth-only draw
-            // can leave old CB registers bound, but it must not become the
-            // advertised writer of those surfaces merely because they remain
-            // in state.
-            if (hasPixelShader)
-            {
-                state.RenderTargetWriters[target.Address] = new RenderTargetWriter(
-                    drawSequence,
-                    hasExportShader ? exportShaderAddress : 0,
-                    pixelShaderAddress,
-                    vertexCount,
-                    primitiveType);
-            }
+            // Do not advertise a writer until translation has succeeded and the
+            // host draw has actually been enqueued. Test 08 recorded bound
+            // targets here even when the shader was rejected later, causing the
+            // presentation selector to capture untouched black images.
 
             if (_traceAgcShader ||
                 _tracePixelShaderAddress == pixelShaderAddress ||
@@ -6068,6 +6059,22 @@ public static partial class AgcExports
                         translatedDraw.RenderState,
                         translatedDraw.DepthTarget,
                         translatedDraw.PixelShaderAddress);
+                }
+
+                foreach (var renderTarget in drawRenderTargets)
+                {
+                    if (renderTarget.Address == 0)
+                    {
+                        continue;
+                    }
+
+                    state.RenderTargetWriters[renderTarget.Address] =
+                        new RenderTargetWriter(
+                            drawSequence,
+                            exportShaderAddress,
+                            pixelShaderAddress,
+                            vertexCount,
+                            primitiveType);
                 }
             }
             else
@@ -6331,18 +6338,8 @@ public static partial class AgcExports
                     return false;
                 }
 
-                texture = new TextureDescriptor(
-                    0,
-                    1,
-                    1,
-                    Gen5TextureFormatR8G8B8A8Unorm,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0xFAC);
+                texture = CreateFallbackTextureDescriptor(
+                    binding.ResourceDescriptor);
             }
 
             textures.Add(new TranslatedImageBinding(
@@ -6537,56 +6534,47 @@ public static partial class AgcExports
             var hasPoisonImageSlots = hasAnyImageSlot && !hasUsablePixelImage;
             if (hasPoisonImageSlots && !hasUsablePixelGlobal)
             {
-                error = Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
-                    pixelShaderAddress)
-                    ? "empty-srt-scalar-pointer-fallback"
-                    : "empty-srt-no-usable-resources";
+                var scalarPointerFallback =
+                    Gen5ShaderScalarEvaluator.WasEmptySrtScalarPointerFallback(
+                        pixelShaderAddress);
+                if (scalarPointerFallback)
+                {
+                    error = "empty-srt-scalar-pointer-fallback";
+                    lock (_submitTraceGate)
+                    {
+                        if (_tracedEmptySrtDrawRejects.Add(pixelShaderAddress))
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] agc.draw_reject ps=0x{pixelShaderAddress:X16} " +
+                                $"es=0x{exportShaderAddress:X16} reason={error}");
+                        }
+                    }
+
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    ReturnPooledEvaluationArrays(pixelEvaluation);
+                    return false;
+                }
+
+                // Test 09: a direct image slot can legitimately be null for the
+                // branch selected by this draw. The normal binding builder already
+                // converts an invalid/null descriptor into a bounded 1x1 texture.
+                // Keep the draw instead of dropping the entire composition pass.
                 lock (_submitTraceGate)
                 {
                     if (_tracedEmptySrtDrawRejects.Add(pixelShaderAddress))
                     {
                         Console.Error.WriteLine(
-                            $"[LOADER][WARN] agc.draw_reject ps=0x{pixelShaderAddress:X16} " +
-                            $"es=0x{exportShaderAddress:X16} reason={error}");
+                            $"[LOADER][TRACE] agc.draw_null_texture_compat " +
+                            $"ps=0x{pixelShaderAddress:X16} " +
+                            $"es=0x{exportShaderAddress:X16} " +
+                            $"bindings={pixelEvaluation.ImageBindings.Count}");
                         Console.Error.WriteLine(
-                            $"[LOADER][WARN] agc.draw_reject_state ps=0x{pixelShaderAddress:X16} " +
+                            $"[LOADER][TRACE] agc.draw_null_texture_state " +
+                            $"ps=0x{pixelShaderAddress:X16} " +
                             $"header=0x{pixelShaderHeader:X16} " +
                             Gen5ShaderTranslator.DescribeState(pixelState));
-                        var shDump = new List<string>(16);
-                        for (uint reg = 0x8; reg <= 0x1C; reg++)
-                        {
-                            if (state.ShRegisters.TryGetValue(reg, out var value))
-                            {
-                                shDump.Add($"0x{reg:X}={value:X8}");
-                            }
-                        }
-
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] agc.draw_reject_sh ps=0x{pixelShaderAddress:X16} " +
-                            $"[{string.Join(',', shDump)}]");
-                        var bindingIndex = 0;
-                        foreach (var binding in pixelEvaluation.ImageBindings)
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][WARN] agc.draw_reject_binding ps=0x{pixelShaderAddress:X16} " +
-                                $"[{bindingIndex++}] pc=0x{binding.Pc:X} op={binding.Opcode} " +
-                                $"resource={FormatShaderDwords(binding.ResourceDescriptor)} " +
-                                $"sampler={FormatShaderDwords(binding.SamplerDescriptor)}");
-                        }
-
-                        foreach (var binding in pixelEvaluation.GlobalMemoryBindings)
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][WARN] agc.draw_reject_global ps=0x{pixelShaderAddress:X16} " +
-                                $"s{binding.ScalarAddress} base=0x{binding.BaseAddress:X16} " +
-                                $"bytes={binding.DataLength}");
-                        }
                     }
                 }
-
-                ReturnPooledEvaluationArrays(exportEvaluation);
-                ReturnPooledEvaluationArrays(pixelEvaluation);
-                return false;
             }
         }
 
@@ -6939,8 +6927,8 @@ public static partial class AgcExports
                     return false;
                 }
 
-                texture = new TextureDescriptor(
-                    0, 1, 1, Gen5TextureFormatR8G8B8A8Unorm, 0, 0, 0, 0, 0, 1, 0xFAC);
+                texture = CreateFallbackTextureDescriptor(
+                    binding.ResourceDescriptor);
             }
 
             var isStorage = Gen5ShaderTranslator.RequiresStorageImage(
