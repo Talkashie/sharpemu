@@ -144,7 +144,11 @@ public static partial class AgcExports
     private const uint GsUserDataRegister = 0x8C;
     private const uint EsUserDataRegister = 0xCC;
     private const uint ComputeUserDataRegister = 0x240;
-    private const uint NggUserDataScalarRegisterBase = 8;
+    // Isaac's NGG export shaders consume their seventh user-data dword
+    // through s12:s13. Starting the hardware user-data window at s6 maps
+    // index 6 to that register pair; the previous s8 base misplaced the
+    // same pointer in s14:s15 and left the shader's s12 load unbound.
+    private const uint NggUserDataScalarRegisterBase = 6;
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 10;
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
@@ -293,6 +297,7 @@ public static partial class AgcExports
     private static int _softwarePresenterPreferenceTraceCount;
     private static int _renderTargetPresenterPreferenceTraceCount;
     private static int _fullSizeDrawTraceCount;
+    private static int _exportUserDataBaseTraceCount;
     // Test 10: cycle among the small set of display-sized render targets long
     // enough to expose a completed/stale target that newest-writer selection
     // may miss. Disable with SHARPEMU_DISABLE_RENDER_TARGET_CYCLE=1.
@@ -6477,6 +6482,17 @@ public static partial class AgcExports
                 userDataScalarRegisterBase: NggUserDataScalarRegisterBase))
         {
             return false;
+        }
+
+        var exportUserDataBaseTrace = Interlocked.Increment(
+            ref _exportUserDataBaseTraceCount);
+        if (exportUserDataBaseTrace <= 8)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.export_user_data_base " +
+                $"sample={exportUserDataBaseTrace} " +
+                $"shader=0x{exportShaderAddress:X16} " +
+                $"base=s{NggUserDataScalarRegisterBase}");
         }
 
         if (!Gen5ShaderScalarEvaluator.TryEvaluate(
