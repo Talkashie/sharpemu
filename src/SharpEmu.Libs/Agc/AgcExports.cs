@@ -291,15 +291,25 @@ public static partial class AgcExports
     private static int _flipRouteProbeCount;
     private static int _translatedFlipPreferenceTraceCount;
     private static int _softwarePresenterPreferenceTraceCount;
-    // Test 07: Isaac's retained translated draw is only a diagnostic-looking
-    // full-screen gradient, not the composed game frame. Prefer the most recent
-    // sampled texture as a software-present source. This route is conservative:
-    // TrySoftwarePresent accepts only linear 2D RGBA8 textures and falls back to
-    // the normal cached scanout when the descriptor is not suitable.
-    private static readonly bool _preferSoftwarePresenterAtPresent = !string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_SOFTWARE_PRESENTER_PREFERENCE"),
-        "1",
-        StringComparison.Ordinal);
+    private static int _renderTargetPresenterPreferenceTraceCount;
+    // Test 08: Test 07 proved that the most recently bound sampled texture is
+    // usually an asset atlas, not the composed frame. Prefer the newest
+    // full-display-sized color render target instead and capture it in guest
+    // queue order. This stays entirely on the Vulkan path and avoids the
+    // multi-megabyte CPU read/scale/write performed by TrySoftwarePresent.
+    private static readonly bool _preferRenderTargetPresenterAtPresent =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RENDER_TARGET_PRESENTER_PREFERENCE"),
+            "1",
+            StringComparison.Ordinal);
+    // Keep Test 07's asset-atlas viewer only as an explicit diagnostic escape
+    // hatch. It is intentionally off by default because it can reduce the
+    // presentation rate to a fraction of one FPS.
+    private static readonly bool _preferSoftwarePresenterAtPresent =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SOFTWARE_PRESENTER_PREFERENCE"),
+            "1",
+            StringComparison.Ordinal);
     // Keep the Test 06 route available only as an explicit A/B escape hatch.
     private static readonly bool _preferTranslatedFlipAtPresent = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TRANSLATED_FLIP_PREFERENCE"),
@@ -3536,9 +3546,60 @@ public static partial class AgcExports
                     handle,
                     displayBufferIndex,
                     out var cachedDisplayBuffer);
+                var renderTargetPresenterAttempted = false;
+                var renderTargetPresenterSubmitted = false;
+                var renderTargetPresenterCandidate = default(RenderTargetDescriptor);
+                var renderTargetPresenterWriter = default(RenderTargetWriter);
+                var renderTargetCandidateCount = 0;
+                if (_preferRenderTargetPresenterAtPresent &&
+                    hasCachedDisplayBuffer &&
+                    state.SawIndexedDraw &&
+                    TrySelectPresentationRenderTarget(
+                        state,
+                        cachedDisplayBuffer.Address,
+                        cachedDisplayBuffer.Width,
+                        cachedDisplayBuffer.Height,
+                        out renderTargetPresenterCandidate,
+                        out renderTargetPresenterWriter,
+                        out renderTargetCandidateCount))
+                {
+                    renderTargetPresenterAttempted = true;
+                    renderTargetPresenterSubmitted =
+                        GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
+                            handle,
+                            displayBufferIndex,
+                            renderTargetPresenterCandidate.Address,
+                            renderTargetPresenterCandidate.Width,
+                            renderTargetPresenterCandidate.Height,
+                            renderTargetPresenterCandidate.Width);
+                }
+
+                if (_preferRenderTargetPresenterAtPresent && hasCachedDisplayBuffer)
+                {
+                    var renderTargetTrace = Interlocked.Increment(
+                        ref _renderTargetPresenterPreferenceTraceCount);
+                    if (renderTargetTrace <= 8 || renderTargetTrace % 120 == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.render_target_present_preferred " +
+                            $"sample={renderTargetTrace} attempted={(renderTargetPresenterAttempted ? 1 : 0)} " +
+                            $"submitted={(renderTargetPresenterSubmitted ? 1 : 0)} " +
+                            $"handle={handle} index={displayBufferIndex} " +
+                            $"candidates={renderTargetCandidateCount} " +
+                            $"src={(renderTargetPresenterCandidate.Address == 0 ? "none" : $"0x{renderTargetPresenterCandidate.Address:X16}")} " +
+                            $"size={renderTargetPresenterCandidate.Width}x{renderTargetPresenterCandidate.Height} " +
+                            $"fmt={renderTargetPresenterCandidate.Format} " +
+                            $"num={renderTargetPresenterCandidate.NumberType} " +
+                            $"tile={renderTargetPresenterCandidate.TileMode} " +
+                            $"writer={renderTargetPresenterWriter.Sequence} " +
+                            $"ps=0x{renderTargetPresenterWriter.PixelShaderAddress:X16}");
+                    }
+                }
+
                 var softwarePresenterAttempted = false;
                 var softwarePresenterSubmitted = false;
-                if (_preferSoftwarePresenterAtPresent &&
+                if (!renderTargetPresenterSubmitted &&
+                    _preferSoftwarePresenterAtPresent &&
                     state.SawIndexedDraw &&
                     state.PresenterTexture is { } softwareSourceTexture)
                 {
@@ -3567,11 +3628,13 @@ public static partial class AgcExports
                 }
 
                 var preferTranslatedFlip =
+                    !renderTargetPresenterSubmitted &&
                     !softwarePresenterSubmitted &&
                     _preferTranslatedFlipAtPresent &&
                     state.SawIndexedDraw &&
                     state.TranslatedDraw is not null;
                 var cachedFlipSubmitted = hasCachedDisplayBuffer &&
+                    !renderTargetPresenterSubmitted &&
                     !softwarePresenterSubmitted &&
                     !preferTranslatedFlip &&
                     GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
@@ -3603,6 +3666,7 @@ public static partial class AgcExports
                         $"[LOADER][TRACE] agc.flip_route sample={flipRouteProbe} " +
                         $"handle={handle} index={displayBufferIndex} " +
                         $"display={(hasCachedDisplayBuffer ? $"0x{cachedDisplayBuffer.Address:X16} {cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height}" : "missing")} " +
+                        $"render_target_present={(renderTargetPresenterSubmitted ? 1 : 0)} " +
                         $"software_present={(softwarePresenterSubmitted ? 1 : 0)} " +
                         $"cache_submitted={(cachedFlipSubmitted ? 1 : 0)} " +
                         $"prefer_translated={(preferTranslatedFlip ? 1 : 0)} " +
@@ -3613,7 +3677,16 @@ public static partial class AgcExports
                         $"draw_kind={state.GuestDrawKind} targets={state.KnownRenderTargets.Count}");
                 }
 
-                if (softwarePresenterSubmitted)
+                if (renderTargetPresenterSubmitted)
+                {
+                    TraceAgcShader(
+                        $"agc.render_target_presenter " +
+                        $"src=0x{renderTargetPresenterCandidate.Address:X16} " +
+                        $"{renderTargetPresenterCandidate.Width}x{renderTargetPresenterCandidate.Height} " +
+                        $"writer={renderTargetPresenterWriter.Sequence} " +
+                        $"ps=0x{renderTargetPresenterWriter.PixelShaderAddress:X16}");
+                }
+                else if (softwarePresenterSubmitted)
                 {
                     TraceDisplayBuffer(
                         handle,
@@ -10870,6 +10943,58 @@ public static partial class AgcExports
             LastLevel: 0,
             Pitch: 1,
             DstSelect: 0xFAC);
+    }
+
+    private static bool TrySelectPresentationRenderTarget(
+        SubmittedDcbState state,
+        ulong displayAddress,
+        uint displayWidth,
+        uint displayHeight,
+        out RenderTargetDescriptor selectedTarget,
+        out RenderTargetWriter selectedWriter,
+        out int candidateCount)
+    {
+        selectedTarget = default;
+        selectedWriter = default;
+        candidateCount = 0;
+        long selectedDimensionPenalty = long.MaxValue;
+
+        foreach (var pair in state.RenderTargetWriters)
+        {
+            if (pair.Key == 0 ||
+                pair.Key == displayAddress ||
+                pair.Value.Sequence == 0 ||
+                !state.KnownRenderTargets.TryGetValue(pair.Key, out var target) ||
+                target.Address == 0 ||
+                target.Width == 0 ||
+                target.Height == 0)
+            {
+                continue;
+            }
+
+            var widthDelta = Math.Abs((long)target.Width - displayWidth);
+            var heightDelta = Math.Abs((long)target.Height - displayHeight);
+            // Isaac's internal 1080p surfaces are commonly padded to 1088
+            // scanlines. Do not consider unrelated atlases or small effects.
+            if (widthDelta > 16 || heightDelta > 16)
+            {
+                continue;
+            }
+
+            candidateCount++;
+            var dimensionPenalty = widthDelta + heightDelta;
+            if (selectedTarget.Address == 0 ||
+                pair.Value.Sequence > selectedWriter.Sequence ||
+                (pair.Value.Sequence == selectedWriter.Sequence &&
+                 dimensionPenalty < selectedDimensionPenalty))
+            {
+                selectedTarget = target;
+                selectedWriter = pair.Value;
+                selectedDimensionPenalty = dimensionPenalty;
+            }
+        }
+
+        return selectedTarget.Address != 0;
     }
 
     private static bool TrySoftwarePresent(
