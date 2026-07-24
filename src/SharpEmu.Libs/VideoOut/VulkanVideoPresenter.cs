@@ -13430,14 +13430,14 @@ internal static unsafe class VulkanVideoPresenter
                 _directPresentationCount++;
                 if (_oneShotPresentationProbeEnabled && _directPresentationCount == 1)
                 {
-                    // Drain after this present finishes so the diagnostic readback
-                    // cannot clobber the command buffer currently being recorded.
-                    _pendingAliasImageDumps.Enqueue(presentedGuestImage);
+                    // Metadata only. A synchronous source-image readback here can
+                    // block the presenter behind ordered guest GPU work and fill
+                    // the producer queue before the first frame completes.
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.present_source_probe " +
                         $"addr=0x{presentedGuestImage.Address:X16} " +
                         $"size={presentedGuestImage.Width}x{presentedGuestImage.Height} " +
-                        $"format={presentedGuestImage.Format}");
+                        $"format={presentedGuestImage.Format} readback=disabled");
                 }
 
                 var traceAddressedPresentation =
