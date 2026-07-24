@@ -290,13 +290,19 @@ public static partial class AgcExports
     private static int _textureFallbackTraceCount;
     private static int _flipRouteProbeCount;
     private static int _translatedFlipPreferenceTraceCount;
-    // Diagnostic compatibility route: when a translated draw is available at
-    // RFlip, prefer it over the cached guest display image. Isaac currently
-    // produces a valid translated candidate while the cached scanout remains
-    // black. Set SHARPEMU_DISABLE_TRANSLATED_FLIP_PREFERENCE=1 to restore the
-    // original cached-image-first behavior.
-    private static readonly bool _preferTranslatedFlipAtPresent = !string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_TRANSLATED_FLIP_PREFERENCE"),
+    private static int _softwarePresenterPreferenceTraceCount;
+    // Test 07: Isaac's retained translated draw is only a diagnostic-looking
+    // full-screen gradient, not the composed game frame. Prefer the most recent
+    // sampled texture as a software-present source. This route is conservative:
+    // TrySoftwarePresent accepts only linear 2D RGBA8 textures and falls back to
+    // the normal cached scanout when the descriptor is not suitable.
+    private static readonly bool _preferSoftwarePresenterAtPresent = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_SOFTWARE_PRESENTER_PREFERENCE"),
+        "1",
+        StringComparison.Ordinal);
+    // Keep the Test 06 route available only as an explicit A/B escape hatch.
+    private static readonly bool _preferTranslatedFlipAtPresent = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TRANSLATED_FLIP_PREFERENCE"),
         "1",
         StringComparison.Ordinal);
     private static readonly object _softwarePresenterGate = new();
@@ -3530,11 +3536,43 @@ public static partial class AgcExports
                     handle,
                     displayBufferIndex,
                     out var cachedDisplayBuffer);
+                var softwarePresenterAttempted = false;
+                var softwarePresenterSubmitted = false;
+                if (_preferSoftwarePresenterAtPresent &&
+                    state.SawIndexedDraw &&
+                    state.PresenterTexture is { } softwareSourceTexture)
+                {
+                    softwarePresenterAttempted = true;
+                    softwarePresenterSubmitted = TrySoftwarePresent(
+                        ctx,
+                        softwareSourceTexture,
+                        handle,
+                        displayBufferIndex);
+                    var softwareTrace = Interlocked.Increment(
+                        ref _softwarePresenterPreferenceTraceCount);
+                    if (softwareTrace <= 8 || softwareTrace % 120 == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.software_present_preferred " +
+                            $"sample={softwareTrace} submitted={(softwarePresenterSubmitted ? 1 : 0)} " +
+                            $"handle={handle} index={displayBufferIndex} " +
+                            $"src=0x{softwareSourceTexture.Address:X16} " +
+                            $"{softwareSourceTexture.Width}x{softwareSourceTexture.Height} " +
+                            $"fmt={softwareSourceTexture.Format} " +
+                            $"num={softwareSourceTexture.NumberType} " +
+                            $"tile={softwareSourceTexture.TileMode} " +
+                            $"type={softwareSourceTexture.Type} " +
+                            $"pitch={softwareSourceTexture.Pitch}");
+                    }
+                }
+
                 var preferTranslatedFlip =
+                    !softwarePresenterSubmitted &&
                     _preferTranslatedFlipAtPresent &&
                     state.SawIndexedDraw &&
                     state.TranslatedDraw is not null;
                 var cachedFlipSubmitted = hasCachedDisplayBuffer &&
+                    !softwarePresenterSubmitted &&
                     !preferTranslatedFlip &&
                     GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
                         handle,
@@ -3565,6 +3603,7 @@ public static partial class AgcExports
                         $"[LOADER][TRACE] agc.flip_route sample={flipRouteProbe} " +
                         $"handle={handle} index={displayBufferIndex} " +
                         $"display={(hasCachedDisplayBuffer ? $"0x{cachedDisplayBuffer.Address:X16} {cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height}" : "missing")} " +
+                        $"software_present={(softwarePresenterSubmitted ? 1 : 0)} " +
                         $"cache_submitted={(cachedFlipSubmitted ? 1 : 0)} " +
                         $"prefer_translated={(preferTranslatedFlip ? 1 : 0)} " +
                         $"indexed={(state.SawIndexedDraw ? 1 : 0)} " +
@@ -3574,7 +3613,15 @@ public static partial class AgcExports
                         $"draw_kind={state.GuestDrawKind} targets={state.KnownRenderTargets.Count}");
                 }
 
-                if (cachedFlipSubmitted)
+                if (softwarePresenterSubmitted)
+                {
+                    TraceDisplayBuffer(
+                        handle,
+                        displayBufferIndex,
+                        cachedDisplayBuffer,
+                        "software-source");
+                }
+                else if (cachedFlipSubmitted)
                 {
                     TraceDisplayBuffer(
                         handle,
@@ -3626,7 +3673,9 @@ public static partial class AgcExports
                             $"storage={binding.IsStorage}");
                     }
                 }
-                else if (state.SawIndexedDraw && state.PresenterTexture is { } sourceTexture)
+                else if (!softwarePresenterAttempted &&
+                    state.SawIndexedDraw &&
+                    state.PresenterTexture is { } sourceTexture)
                 {
                     _ = TrySoftwarePresent(
                         ctx,
