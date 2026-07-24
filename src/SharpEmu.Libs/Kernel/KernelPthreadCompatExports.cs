@@ -37,8 +37,19 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    // Gen5 libc wrappers can issue nested lock calls for one logical ownership
+    // chain and then balance them with matching unlocks. Strict EDEADLK leaves
+    // the guest-side count ahead of the HLE count, producing the repeated
+    // deadlock/invalid-unlock loop seen when Isaac accepts menu input.
+    // Set SHARPEMU_STRICT_ERRORCHECK_MUTEX=1 to restore strict ERRORCHECK behavior.
+    private static readonly bool _strictErrorCheckMutex =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_STRICT_ERRORCHECK_MUTEX"),
+            "1",
+            StringComparison.Ordinal);
     private static long _nextSynchronizationWaiterId;
     private static int _automaticMutexErrorTraceCount;
+    private static int _automaticMutexCompatTraceCount;
 
     private sealed class PthreadMutexState
     {
@@ -859,6 +870,13 @@ public static class KernelPthreadCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
+            if (!tryOnly && state.Type == MutexTypeErrorCheck && !_strictErrorCheckMutex)
+            {
+                state.IncrementRecursion();
+                TracePthreadMutex(ctx, "lock-errorcheck-compat", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
             var ownedResult = tryOnly
                 ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
@@ -917,10 +935,16 @@ public static class KernelPthreadCompatExports
                     // over a NORMAL kernel mutex. Returning EDEADLK here
                     // leaves that guest bookkeeping out of sync with the HLE owner and
                     // turns the wrapper into a permanent lock/unlock retry loop. Keep
-                    // the compatibility recursion used by the original implementation;
-                    // ERRORCHECK mutexes still take the strict EDEADLK path below.
+                    // the compatibility recursion used by the original implementation.
                     state.RecursionCount++;
                     TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (!tryOnly && state.Type == MutexTypeErrorCheck && !_strictErrorCheckMutex)
+                {
+                    state.RecursionCount++;
+                    TracePthreadMutex(ctx, "lock-errorcheck-compat", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
                 else
@@ -2155,11 +2179,27 @@ public static class KernelPthreadCompatExports
             result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK ||
             result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT ||
             result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
-        if (!explicitlyEnabled &&
-            (!isSynchronizationError ||
-             Interlocked.Increment(ref _automaticMutexErrorTraceCount) > 64))
+        var isCompatibilityEvent = operation == "lock-errorcheck-compat";
+        if (!explicitlyEnabled)
         {
-            return;
+            if (isSynchronizationError)
+            {
+                if (Interlocked.Increment(ref _automaticMutexErrorTraceCount) > 64)
+                {
+                    return;
+                }
+            }
+            else if (isCompatibilityEvent)
+            {
+                if (Interlocked.Increment(ref _automaticMutexCompatTraceCount) > 32)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                return;
+            }
         }
 
         _ = KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var guestWord0);

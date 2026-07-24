@@ -508,13 +508,6 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_EVENTS"),
             "1",
             StringComparison.Ordinal);
-    // Isaac-Testing branch probe: capture exactly one presented source image and
-    // one swapchain image. Set SHARPEMU_DISABLE_ONE_SHOT_PRESENT_PROBE=1 to opt out.
-    private static readonly bool _oneShotPresentationProbeEnabled =
-        !string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_ONE_SHOT_PRESENT_PROBE"),
-            "1",
-            StringComparison.Ordinal);
     private static readonly bool _traceGuestWorkCompletion =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WORK_COMPLETION"),
@@ -13428,18 +13421,6 @@ internal static unsafe class VulkanVideoPresenter
             if (presentedGuestImage is not null)
             {
                 _directPresentationCount++;
-                if (_oneShotPresentationProbeEnabled && _directPresentationCount == 1)
-                {
-                    // Metadata only. A synchronous source-image readback here can
-                    // block the presenter behind ordered guest GPU work and fill
-                    // the producer queue before the first frame completes.
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] vk.present_source_probe " +
-                        $"addr=0x{presentedGuestImage.Address:X16} " +
-                        $"size={presentedGuestImage.Width}x{presentedGuestImage.Height} " +
-                        $"format={presentedGuestImage.Format} readback=disabled");
-                }
-
                 var traceAddressedPresentation =
                     ShouldTraceAddressedPresentedGuestImage(presentedGuestImage);
                 if (traceAddressedPresentation ||
@@ -15813,7 +15794,6 @@ internal static unsafe class VulkanVideoPresenter
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
-                _oneShotPresentationProbeEnabled && !_tracedPresentedSwapchain ||
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                 (!_tracedPresentedSwapchain ||
                  periodicDumpInterval > 0 && presentedCount % periodicDumpInterval == 0);

@@ -38,6 +38,8 @@ public static class PadExports
 
     private static bool _initialized;
     private static int _controlsAnnouncementLogged;
+    private static int _lastLoggedButtons;
+    private static int _buttonTraceInitialized;
 
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
@@ -530,6 +532,8 @@ public static class PadExports
             buttons |= 0x4000;
         }
 
+        TraceButtonEdges(buttons);
+
         _cachedInputState = new PadState(
             Connected: true,
             Buttons: buttons,
@@ -541,6 +545,56 @@ public static class PadExports
             R2: r2);
         _lastInputSampleTicks = now;
         return _cachedInputState;
+    }
+
+    private static void TraceButtonEdges(uint buttons)
+    {
+        var previous = unchecked((uint)Interlocked.Exchange(
+            ref _lastLoggedButtons,
+            unchecked((int)buttons)));
+        if (Interlocked.Exchange(ref _buttonTraceInitialized, 1) == 0)
+        {
+            previous = 0;
+        }
+
+        if (previous == buttons)
+        {
+            return;
+        }
+
+        var pressed = buttons & ~previous;
+        var released = previous & ~buttons;
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] pad.button_edge current=0x{buttons:X8} " +
+            $"pressed=0x{pressed:X8}({DescribeButtons(pressed)}) " +
+            $"released=0x{released:X8}({DescribeButtons(released)})");
+    }
+
+    private static string DescribeButtons(uint buttons)
+    {
+        if (buttons == 0)
+        {
+            return "none";
+        }
+
+        var names = new List<string>();
+        if ((buttons & OrbisPadButton.Up) != 0) names.Add("Up");
+        if ((buttons & OrbisPadButton.Down) != 0) names.Add("Down");
+        if ((buttons & OrbisPadButton.Left) != 0) names.Add("Left");
+        if ((buttons & OrbisPadButton.Right) != 0) names.Add("Right");
+        if ((buttons & OrbisPadButton.Cross) != 0) names.Add("Cross/A");
+        if ((buttons & OrbisPadButton.Circle) != 0) names.Add("Circle/B");
+        if ((buttons & OrbisPadButton.Square) != 0) names.Add("Square/X");
+        if ((buttons & OrbisPadButton.Triangle) != 0) names.Add("Triangle/Y");
+        if ((buttons & OrbisPadButton.L1) != 0) names.Add("L1");
+        if ((buttons & OrbisPadButton.R1) != 0) names.Add("R1");
+        if ((buttons & OrbisPadButton.L2) != 0) names.Add("L2");
+        if ((buttons & OrbisPadButton.R2) != 0) names.Add("R2");
+        if ((buttons & OrbisPadButton.L3) != 0) names.Add("L3");
+        if ((buttons & OrbisPadButton.R3) != 0) names.Add("R3");
+        if ((buttons & OrbisPadButton.Options) != 0) names.Add("Options/Start");
+        if ((buttons & OrbisPadButton.TouchPad) != 0) names.Add("TouchPad");
+        return names.Count == 0 ? "other" : string.Join("+", names);
     }
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
