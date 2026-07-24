@@ -3566,6 +3566,7 @@ public static partial class AgcExports
                     state.SawIndexedDraw &&
                     TrySelectPresentationRenderTarget(
                         state,
+                        handle,
                         cachedDisplayBuffer.Address,
                         cachedDisplayBuffer.Width,
                         cachedDisplayBuffer.Height,
@@ -3805,12 +3806,14 @@ public static partial class AgcExports
 
     private static void TraceFramePacketSummary(SubmittedDcbState state)
     {
+        // Presentation diagnostics also use this counter. It must advance on
+        // every flip even when verbose packet tracing is disabled.
+        var flip = ++state.FlipCount;
         if (!_traceFramePackets)
         {
             return;
         }
 
-        var flip = ++state.FlipCount;
         if (flip <= 8 || flip % 60 == 0 || state.FrameDrawCount == 0)
         {
             var opcodes = string.Join(
@@ -10983,6 +10986,7 @@ public static partial class AgcExports
 
     private static bool TrySelectPresentationRenderTarget(
         SubmittedDcbState state,
+        int videoOutHandle,
         ulong displayAddress,
         uint displayWidth,
         uint displayHeight,
@@ -10996,12 +11000,26 @@ public static partial class AgcExports
         selectedCandidateIndex = -1;
         candidateCount = 0;
 
+        var registeredDisplayAddresses = new HashSet<ulong>();
+        for (var displayIndex = 0; displayIndex < 16; displayIndex++)
+        {
+            if (VideoOutExports.TryGetDisplayBufferInfo(
+                    videoOutHandle,
+                    displayIndex,
+                    out var registeredDisplayBuffer) &&
+                registeredDisplayBuffer.Address != 0)
+            {
+                registeredDisplayAddresses.Add(registeredDisplayBuffer.Address);
+            }
+        }
+
         var candidates =
             new List<(RenderTargetDescriptor Target, RenderTargetWriter Writer, long Penalty)>();
         foreach (var pair in state.RenderTargetWriters)
         {
             if (pair.Key == 0 ||
                 pair.Key == displayAddress ||
+                registeredDisplayAddresses.Contains(pair.Key) ||
                 pair.Value.Sequence == 0 ||
                 !state.KnownRenderTargets.TryGetValue(pair.Key, out var target) ||
                 target.Address == 0 ||
