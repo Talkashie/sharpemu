@@ -289,6 +289,16 @@ public static partial class AgcExports
     private static long _packetParseFailureTraceCount;
     private static int _textureFallbackTraceCount;
     private static int _flipRouteProbeCount;
+    private static int _translatedFlipPreferenceTraceCount;
+    // Diagnostic compatibility route: when a translated draw is available at
+    // RFlip, prefer it over the cached guest display image. Isaac currently
+    // produces a valid translated candidate while the cached scanout remains
+    // black. Set SHARPEMU_DISABLE_TRANSLATED_FLIP_PREFERENCE=1 to restore the
+    // original cached-image-first behavior.
+    private static readonly bool _preferTranslatedFlipAtPresent = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_TRANSLATED_FLIP_PREFERENCE"),
+        "1",
+        StringComparison.Ordinal);
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
@@ -3520,7 +3530,12 @@ public static partial class AgcExports
                     handle,
                     displayBufferIndex,
                     out var cachedDisplayBuffer);
+                var preferTranslatedFlip =
+                    _preferTranslatedFlipAtPresent &&
+                    state.SawIndexedDraw &&
+                    state.TranslatedDraw is not null;
                 var cachedFlipSubmitted = hasCachedDisplayBuffer &&
+                    !preferTranslatedFlip &&
                     GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
                         handle,
                         displayBufferIndex,
@@ -3528,6 +3543,21 @@ public static partial class AgcExports
                         cachedDisplayBuffer.Width,
                         cachedDisplayBuffer.Height,
                         cachedDisplayBuffer.PitchInPixel);
+                if (preferTranslatedFlip)
+                {
+                    var preferenceTrace = Interlocked.Increment(
+                        ref _translatedFlipPreferenceTraceCount);
+                    if (preferenceTrace <= 8 || preferenceTrace % 120 == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.translated_flip_preferred " +
+                            $"sample={preferenceTrace} handle={handle} " +
+                            $"index={displayBufferIndex} " +
+                            $"display=0x{cachedDisplayBuffer.Address:X16} " +
+                            $"{cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height}");
+                    }
+                }
+
                 var flipRouteProbe = Interlocked.Increment(ref _flipRouteProbeCount);
                 if (flipRouteProbe <= 8)
                 {
@@ -3536,6 +3566,7 @@ public static partial class AgcExports
                         $"handle={handle} index={displayBufferIndex} " +
                         $"display={(hasCachedDisplayBuffer ? $"0x{cachedDisplayBuffer.Address:X16} {cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height}" : "missing")} " +
                         $"cache_submitted={(cachedFlipSubmitted ? 1 : 0)} " +
+                        $"prefer_translated={(preferTranslatedFlip ? 1 : 0)} " +
                         $"indexed={(state.SawIndexedDraw ? 1 : 0)} " +
                         $"translated={(state.TranslatedDraw is not null ? 1 : 0)} " +
                         $"pending={(state.PendingTargetlessDraw is not null ? 1 : 0)} " +
