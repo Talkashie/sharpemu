@@ -38,6 +38,7 @@ public static class KernelPthreadCompatExports
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
     private static long _nextSynchronizationWaiterId;
+    private static int _automaticMutexErrorTraceCount;
 
     private sealed class PthreadMutexState
     {
@@ -2149,7 +2150,14 @@ public static class KernelPthreadCompatExports
 
     private static void TracePthreadMutex(CpuContext ctx, string operation, ulong mutexAddress, ulong resolvedAddress, PthreadMutexState? state, ulong currentThreadId, int result)
     {
-        if (!ShouldTracePthreadMutex(mutexAddress, resolvedAddress))
+        var explicitlyEnabled = ShouldTracePthreadMutex(mutexAddress, resolvedAddress);
+        var isSynchronizationError =
+            result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK ||
+            result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT ||
+            result == (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
+        if (!explicitlyEnabled &&
+            (!isSynchronizationError ||
+             Interlocked.Increment(ref _automaticMutexErrorTraceCount) > 64))
         {
             return;
         }

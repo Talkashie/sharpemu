@@ -288,6 +288,7 @@ public static partial class AgcExports
     private static long _standardDmaTraceCount;
     private static long _packetParseFailureTraceCount;
     private static int _textureFallbackTraceCount;
+    private static int _flipRouteProbeCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
@@ -3515,17 +3516,34 @@ public static partial class AgcExports
                     state.TranslatedDraw = null;
                 }
 
-                if (VideoOutExports.TryGetDisplayBufferInfo(
-                        handle,
-                        displayBufferIndex,
-                        out var cachedDisplayBuffer) &&
+                var hasCachedDisplayBuffer = VideoOutExports.TryGetDisplayBufferInfo(
+                    handle,
+                    displayBufferIndex,
+                    out var cachedDisplayBuffer);
+                var cachedFlipSubmitted = hasCachedDisplayBuffer &&
                     GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
                         handle,
                         displayBufferIndex,
                         cachedDisplayBuffer.Address,
                         cachedDisplayBuffer.Width,
                         cachedDisplayBuffer.Height,
-                        cachedDisplayBuffer.PitchInPixel))
+                        cachedDisplayBuffer.PitchInPixel);
+                var flipRouteProbe = Interlocked.Increment(ref _flipRouteProbeCount);
+                if (flipRouteProbe <= 8)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.flip_route sample={flipRouteProbe} " +
+                        $"handle={handle} index={displayBufferIndex} " +
+                        $"display={(hasCachedDisplayBuffer ? $"0x{cachedDisplayBuffer.Address:X16} {cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height}" : "missing")} " +
+                        $"cache_submitted={(cachedFlipSubmitted ? 1 : 0)} " +
+                        $"indexed={(state.SawIndexedDraw ? 1 : 0)} " +
+                        $"translated={(state.TranslatedDraw is not null ? 1 : 0)} " +
+                        $"pending={(state.PendingTargetlessDraw is not null ? 1 : 0)} " +
+                        $"presenter_texture={(state.PresenterTexture is not null ? 1 : 0)} " +
+                        $"draw_kind={state.GuestDrawKind} targets={state.KnownRenderTargets.Count}");
+                }
+
+                if (cachedFlipSubmitted)
                 {
                     TraceDisplayBuffer(
                         handle,
