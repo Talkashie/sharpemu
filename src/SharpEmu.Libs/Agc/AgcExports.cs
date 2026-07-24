@@ -292,6 +292,15 @@ public static partial class AgcExports
     private static int _translatedFlipPreferenceTraceCount;
     private static int _softwarePresenterPreferenceTraceCount;
     private static int _renderTargetPresenterPreferenceTraceCount;
+    private static int _fullSizeDrawTraceCount;
+    // Test 10: cycle among the small set of display-sized render targets long
+    // enough to expose a completed/stale target that newest-writer selection
+    // may miss. Disable with SHARPEMU_DISABLE_RENDER_TARGET_CYCLE=1.
+    private static readonly bool _cycleRenderTargetCandidatesAtPresent =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RENDER_TARGET_CYCLE"),
+            "1",
+            StringComparison.Ordinal);
     // Test 08: Test 07 proved that the most recently bound sampled texture is
     // usually an asset atlas, not the composed frame. Prefer the newest
     // full-display-sized color render target instead and capture it in guest
@@ -3550,6 +3559,7 @@ public static partial class AgcExports
                 var renderTargetPresenterSubmitted = false;
                 var renderTargetPresenterCandidate = default(RenderTargetDescriptor);
                 var renderTargetPresenterWriter = default(RenderTargetWriter);
+                var renderTargetCandidateIndex = -1;
                 var renderTargetCandidateCount = 0;
                 if (_preferRenderTargetPresenterAtPresent &&
                     hasCachedDisplayBuffer &&
@@ -3561,6 +3571,7 @@ public static partial class AgcExports
                         cachedDisplayBuffer.Height,
                         out renderTargetPresenterCandidate,
                         out renderTargetPresenterWriter,
+                        out renderTargetCandidateIndex,
                         out renderTargetCandidateCount))
                 {
                     renderTargetPresenterAttempted = true;
@@ -3586,6 +3597,8 @@ public static partial class AgcExports
                             $"submitted={(renderTargetPresenterSubmitted ? 1 : 0)} " +
                             $"handle={handle} index={displayBufferIndex} " +
                             $"candidates={renderTargetCandidateCount} " +
+                            $"candidate_index={renderTargetCandidateIndex} " +
+                            $"cycle={(_cycleRenderTargetCandidatesAtPresent ? 1 : 0)} " +
                             $"src={(renderTargetPresenterCandidate.Address == 0 ? "none" : $"0x{renderTargetPresenterCandidate.Address:X16}")} " +
                             $"size={renderTargetPresenterCandidate.Width}x{renderTargetPresenterCandidate.Height} " +
                             $"fmt={renderTargetPresenterCandidate.Format} " +
@@ -8972,12 +8985,31 @@ public static partial class AgcExports
         IReadOnlyList<GuestDrawTexture> textures,
         IReadOnlyList<GuestVertexBuffer> vertexBuffers)
     {
+        var displaySized = draw.RenderTargets.Any(static target =>
+            target.Address != 0 &&
+            target.Width is >= 1904 and <= 1936 &&
+            target.Height is >= 1064 and <= 1104);
+        var automaticTraceIndex = 0;
         if (!_traceDraws)
         {
-            return;
+            if (!displaySized)
+            {
+                return;
+            }
+
+            automaticTraceIndex = Interlocked.Increment(ref _fullSizeDrawTraceCount);
+            if (automaticTraceIndex > 80 && automaticTraceIndex % 5000 != 0)
+            {
+                return;
+            }
         }
 
         var target = draw.RenderTargets.FirstOrDefault();
+        var targetList = string.Join(
+            '|',
+            draw.RenderTargets.Select(renderTarget =>
+                $"0x{renderTarget.Address:X}:{renderTarget.Width}x{renderTarget.Height}" +
+                $":f{renderTarget.Format}/n{renderTarget.NumberType}/s{renderTarget.Slot}"));
         var blend = draw.RenderState.Blend;
         var viewport = draw.RenderState.Viewport is { } vp
             ? $"{vp.X:0.#},{vp.Y:0.#},{vp.Width:0.#}x{vp.Height:0.#}"
@@ -8988,6 +9020,16 @@ public static partial class AgcExports
                 $"0x{texture.Address:X}:{texture.Width}x{texture.Height}" +
                 $":f{texture.Format}/n{texture.NumberType}/d{texture.DstSelect:X3}" +
                 (texture.IsFallback ? ":FALLBACK" : string.Empty)));
+        var globalList = string.Join(
+            '|',
+            draw.GlobalMemoryBindings.Select(binding =>
+                $"s{binding.ScalarAddress}@0x{binding.BaseAddress:X}" +
+                $":{binding.DataLength}:w{(binding.Writable ? 1 : 0)}"));
+        var vertexList = string.Join(
+            '|',
+            vertexBuffers.Select(buffer =>
+                $"l{buffer.Location}:f{buffer.DataFormat}/n{buffer.NumberFormat}" +
+                $"x{buffer.ComponentCount}:s{buffer.Stride}:o{buffer.OffsetBytes}:b{buffer.Length}"));
         var positions = string.Empty;
         var positionBuffer = vertexBuffers.FirstOrDefault(buffer => buffer.Location == 0);
         if (positionBuffer is { Length: >= 8 })
@@ -9011,14 +9053,20 @@ public static partial class AgcExports
             positions = string.Join(';', sampled);
         }
 
+        var indexInfo = draw.IndexBuffer is { } indexBuffer
+            ? $"bytes={indexBuffer.Length}:bits={(indexBuffer.Is32Bit ? 32 : 16)}"
+            : "none";
         Console.Error.WriteLine(
-            $"[DRAW] seq={sequence} es=0x{draw.ExportShaderAddress:X} ps=0x{draw.PixelShaderAddress:X} " +
+            $"[DRAW] auto={automaticTraceIndex} seq={sequence} " +
+            $"es=0x{draw.ExportShaderAddress:X} ps=0x{draw.PixelShaderAddress:X} " +
             $"target=0x{target.Address:X}:{target.Width}x{target.Height}:f{target.Format}/n{target.NumberType} " +
-            $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
+            $"targets={targetList} prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} " +
+            $"instances={draw.InstanceCount} index={indexInfo} " +
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
-            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
-            $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
+            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} " +
+            $"globals={globalList} vertex_buffers={vertexList} pos={positions} " +
+            $"ps_ud={string.Join(',', draw.PixelUserData.Take(12).Select(value => value.ToString("X8")))} " +
             $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
     }
 
@@ -10940,13 +10988,16 @@ public static partial class AgcExports
         uint displayHeight,
         out RenderTargetDescriptor selectedTarget,
         out RenderTargetWriter selectedWriter,
+        out int selectedCandidateIndex,
         out int candidateCount)
     {
         selectedTarget = default;
         selectedWriter = default;
+        selectedCandidateIndex = -1;
         candidateCount = 0;
-        long selectedDimensionPenalty = long.MaxValue;
 
+        var candidates =
+            new List<(RenderTargetDescriptor Target, RenderTargetWriter Writer, long Penalty)>();
         foreach (var pair in state.RenderTargetWriters)
         {
             if (pair.Key == 0 ||
@@ -10969,16 +11020,43 @@ public static partial class AgcExports
                 continue;
             }
 
-            candidateCount++;
-            var dimensionPenalty = widthDelta + heightDelta;
+            candidates.Add((target, pair.Value, widthDelta + heightDelta));
+        }
+
+        candidateCount = candidates.Count;
+        if (candidateCount == 0)
+        {
+            return false;
+        }
+
+        if (_cycleRenderTargetCandidatesAtPresent && candidateCount > 1)
+        {
+            // Stable address ordering makes each two-second window repeatable.
+            // The flip counter is incremented after route selection, so 120
+            // selects approximately two seconds at the guest's 60 Hz cadence.
+            candidates.Sort(static (left, right) =>
+                left.Target.Address.CompareTo(right.Target.Address));
+            selectedCandidateIndex =
+                (int)((state.FlipCount / 120UL) % (ulong)candidateCount);
+            var cycled = candidates[selectedCandidateIndex];
+            selectedTarget = cycled.Target;
+            selectedWriter = cycled.Writer;
+            return true;
+        }
+
+        long selectedDimensionPenalty = long.MaxValue;
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            var candidate = candidates[index];
             if (selectedTarget.Address == 0 ||
-                pair.Value.Sequence > selectedWriter.Sequence ||
-                (pair.Value.Sequence == selectedWriter.Sequence &&
-                 dimensionPenalty < selectedDimensionPenalty))
+                candidate.Writer.Sequence > selectedWriter.Sequence ||
+                (candidate.Writer.Sequence == selectedWriter.Sequence &&
+                 candidate.Penalty < selectedDimensionPenalty))
             {
-                selectedTarget = target;
-                selectedWriter = pair.Value;
-                selectedDimensionPenalty = dimensionPenalty;
+                selectedTarget = candidate.Target;
+                selectedWriter = candidate.Writer;
+                selectedDimensionPenalty = candidate.Penalty;
+                selectedCandidateIndex = index;
             }
         }
 
