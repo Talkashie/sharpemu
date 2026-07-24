@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026 SharpEmu Emulator Project
+// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
@@ -129,6 +129,7 @@ public static partial class KernelMemoryCompatExports
     private static readonly HashSet<string> _negativeStatCache = new(HostFsPathComparer);
     private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(HostFsPathComparer);
     private static long _nextFileDescriptor = 2;
+    private static long _mkdirTraceCount;
 
     internal static int AllocateGuestFileDescriptor()
     {
@@ -1957,6 +1958,7 @@ public static partial class KernelMemoryCompatExports
     public static int KernelMkdir(CpuContext ctx)
     {
         var pathAddress = ctx[CpuRegister.Rdi];
+        var mode = (ushort)(ctx[CpuRegister.Rsi] & 0xFFFF);
         if (pathAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -1976,13 +1978,39 @@ public static partial class KernelMemoryCompatExports
 
         try
         {
-            if (File.Exists(hostPath) || Directory.Exists(hostPath))
+            var fileExists = File.Exists(hostPath);
+            var directoryExists = Directory.Exists(hostPath);
+            var traceIndex = Interlocked.Increment(ref _mkdirTraceCount);
+            if (traceIndex <= 32 || traceIndex % 1000 == 0)
+            {
+                var parentDirectory = Path.GetDirectoryName(hostPath);
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] kernel.mkdir#{traceIndex} guest='{guestPath}' host='{hostPath}' mode=0{Convert.ToString(mode, 8)} file_exists={fileExists} directory_exists={directoryExists} parent_exists={!string.IsNullOrWhiteSpace(parentDirectory) && Directory.Exists(parentDirectory)}");
+            }
+
+            if (fileExists)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_ALREADY_EXISTS;
             }
 
-            var parentDirectory = Path.GetDirectoryName(hostPath);
-            if (string.IsNullOrWhiteSpace(parentDirectory) || !Directory.Exists(parentDirectory))
+            if (directoryExists)
+            {
+                // Isaac Test 05: determine whether this title's post-input stall is
+                // entered through its EEXIST handling. Keep regular-file collisions
+                // strict, but make an already-created directory idempotent.
+                if (traceIndex <= 32 || traceIndex % 1000 == 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] kernel.mkdir_existing_directory_compat#{traceIndex} guest='{guestPath}' result=success");
+                }
+
+                InvalidateNegativeStatCacheForPathAndAncestors(guestPath);
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            var parentDirectoryForCreate = Path.GetDirectoryName(hostPath);
+            if (string.IsNullOrWhiteSpace(parentDirectoryForCreate) || !Directory.Exists(parentDirectoryForCreate))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
