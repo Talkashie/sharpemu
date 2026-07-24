@@ -53,6 +53,7 @@ public static class Gen5ShaderScalarEvaluator
             "1",
             StringComparison.Ordinal);
     private static int _isaacS12PointerAliasTraceCount;
+    private static int _isaacPrimaryCfgTraceCount;
 
     public static bool WasEmptySrtScalarPointerFallback(ulong shaderAddress) =>
         _emptySrtScalarPointerFallbacks.ContainsKey(shaderAddress);
@@ -308,7 +309,11 @@ public static class Gen5ShaderScalarEvaluator
                         // SC_BRANCH targets here; their fall-through regions are
                         // already visited linearly and forking every vector-mask
                         // condition causes exponential state growth.
-                        if (_cfgResourceDiscovery)
+                        var discoverSupplementalResources =
+                            _cfgResourceDiscovery &&
+                            !IsIsaacExportShaderNeedingS12Alias(
+                                state.Program.Address);
+                        if (discoverSupplementalResources)
                         {
                             var fallthroughPc = instruction.Pc +
                                 (uint)(instruction.Words.Count * sizeof(uint));
@@ -318,6 +323,22 @@ public static class Gen5ShaderScalarEvaluator
                                 execMask,
                                 scalarConditionCode,
                                 supplemental: true);
+                        }
+                        else if (_cfgResourceDiscovery &&
+                                 IsIsaacExportShaderNeedingS12Alias(
+                                     state.Program.Address))
+                        {
+                            var sample = Interlocked.Increment(
+                                ref _isaacPrimaryCfgTraceCount);
+                            if (sample <= 16)
+                            {
+                                Console.Error.WriteLine(
+                                    $"[LOADER][TRACE] agc.isaac_primary_cfg_only " +
+                                    $"sample={sample} " +
+                                    $"shader=0x{state.Program.Address:X16} " +
+                                    $"branch_pc=0x{instruction.Pc:X} " +
+                                    $"target_pc=0x{targetPc:X}");
+                            }
                         }
 
                         skipUntilPc = targetPc;
